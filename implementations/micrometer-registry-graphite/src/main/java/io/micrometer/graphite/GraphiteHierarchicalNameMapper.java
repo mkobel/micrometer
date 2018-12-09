@@ -40,7 +40,7 @@ public class GraphiteHierarchicalNameMapper implements HierarchicalNameMapper {
             }
         }
         hierarchicalName.append(id.getConventionName(convention));
-        for (Tag tag : id.getTags()) {
+        for (Tag tag : id.getTagsAsIterable()) {
             if (!tagsAsPrefix.contains(tag.getKey())) {
                 hierarchicalName.append('.').append(sanitize(convention.tagKey(tag.getKey())))
                         .append('.').append(sanitize(convention.tagValue(tag.getValue())));
@@ -48,10 +48,10 @@ public class GraphiteHierarchicalNameMapper implements HierarchicalNameMapper {
         }
         return hierarchicalName.toString();
     }
-    
+
     private String sanitize(String value) {
         return value.replace(" ", "_");
     }
-    
+
 }
 

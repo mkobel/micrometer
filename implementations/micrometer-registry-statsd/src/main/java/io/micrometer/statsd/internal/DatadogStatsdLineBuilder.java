@@ -26,19 +26,15 @@ import org.pcollections.PMap;
 import java.util.stream.Collectors;
 
 public class DatadogStatsdLineBuilder extends FlavorStatsdLineBuilder {
+    private final Object tagsLock = new Object();
     @SuppressWarnings({"NullableProblems", "unused"})
     private volatile NamingConvention namingConvention;
-
     @SuppressWarnings("NullableProblems")
     private volatile String name;
-
     @Nullable
     private volatile String conventionTags;
-
     @SuppressWarnings("NullableProblems")
     private volatile String tagsNoStat;
-
-    private final Object tagsLock = new Object();
     private volatile PMap<Statistic, String> tags = HashTreePMap.empty();
 
     public DatadogStatsdLineBuilder(Meter.Id id, MeterRegistry.Config config) {
@@ -57,7 +53,7 @@ public class DatadogStatsdLineBuilder extends FlavorStatsdLineBuilder {
             this.namingConvention = next;
             this.name = next.name(sanitize(id.getName()), id.getType(), id.getBaseUnit()) + ":";
             this.tags = HashTreePMap.empty();
-            this.conventionTags = id.getTags().iterator().hasNext() ?
+            this.conventionTags = id.getTagsAsIterable().iterator().hasNext() ?
                     id.getConventionTags(this.namingConvention).stream()
                             .map(t -> sanitize(t.getKey()) + ":" + sanitize(t.getValue()))
                             .collect(Collectors.joining(","))

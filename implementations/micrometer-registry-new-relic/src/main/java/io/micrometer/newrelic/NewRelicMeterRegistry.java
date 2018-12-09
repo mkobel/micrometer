@@ -20,21 +20,22 @@ import io.micrometer.core.instrument.config.NamingConvention;
 import io.micrometer.core.instrument.step.StepMeterRegistry;
 import io.micrometer.core.instrument.util.DoubleFormat;
 import io.micrometer.core.instrument.util.MeterPartition;
-import io.micrometer.core.ipc.http.HttpClient;
-import io.micrometer.core.ipc.http.HttpUrlConnectionClient;
+import io.micrometer.core.instrument.util.NamedThreadFactory;
+import io.micrometer.core.instrument.util.TimeUtils;
+import io.micrometer.core.ipc.http.HttpSender;
+import io.micrometer.core.ipc.http.HttpUrlConnectionSender;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static io.micrometer.core.instrument.Meter.Type.match;
+import static io.micrometer.core.instrument.util.StringEscapeUtils.escapeJson;
 import static java.util.Objects.requireNonNull;
 import static java.util.stream.StreamSupport.stream;
 
@@ -44,19 +45,33 @@ import static java.util.stream.StreamSupport.stream;
  * @author Jon Schneider
  */
 public class NewRelicMeterRegistry extends StepMeterRegistry {
+    private static final ThreadFactory DEFAULT_THREAD_FACTORY = new NamedThreadFactory("new-relic-metrics-publisher");
     private final NewRelicConfig config;
-    private final HttpClient httpClient;
+    private final HttpSender httpClient;
     private final Logger logger = LoggerFactory.getLogger(NewRelicMeterRegistry.class);
 
+    /**
+     * @param config Configuration options for the registry that are describable as properties.
+     * @param clock  The clock to use for timings.
+     */
+    @SuppressWarnings("deprecation")
     public NewRelicMeterRegistry(NewRelicConfig config, Clock clock) {
-        this(config, clock, Executors.defaultThreadFactory());
+        this(config, clock, DEFAULT_THREAD_FACTORY,
+                new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
     }
 
+    /**
+     * @param config        Configuration options for the registry that are describable as properties.
+     * @param clock         The clock to use for timings.
+     * @param threadFactory The thread factory to use to create the publishing thread.
+     * @deprecated Use {@link #builder(NewRelicConfig)} instead.
+     */
+    @Deprecated
     public NewRelicMeterRegistry(NewRelicConfig config, Clock clock, ThreadFactory threadFactory) {
-        this(config, clock, threadFactory, new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout()));
+        this(config, clock, threadFactory, new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
     }
 
-    private NewRelicMeterRegistry(NewRelicConfig config, Clock clock, ThreadFactory threadFactory, HttpClient httpClient) {
+    private NewRelicMeterRegistry(NewRelicConfig config, Clock clock, ThreadFactory threadFactory, HttpSender httpClient) {
         super(config, clock);
         this.config = config;
         this.httpClient = httpClient;
@@ -68,13 +83,25 @@ public class NewRelicMeterRegistry extends StepMeterRegistry {
         start(threadFactory);
     }
 
+    public static Builder builder(NewRelicConfig config) {
+        return new Builder(config);
+    }
+
+    @Override
+    public void start(ThreadFactory threadFactory) {
+        if (config.enabled()) {
+            logger.info("publishing metrics to new relic every " + TimeUtils.format(config.step()));
+        }
+        super.start(threadFactory);
+    }
+
     @Override
     protected void publish() {
         String insightsEndpoint = config.uri() + "/v1/accounts/" + config.accountId() + "/events";
 
         // New Relic's Insights API limits us to 1000 events per call
         for (List<Meter> batch : MeterPartition.partition(this, Math.min(config.batchSize(), 1000))) {
-            sendEvents(insightsEndpoint, batch.stream().flatMap(meter -> match(meter,
+            sendEvents(insightsEndpoint, batch.stream().flatMap(meter -> meter.match(
                     this::writeGauge,
                     this::writeCounter,
                     this::writeTimer,
@@ -161,17 +188,18 @@ public class NewRelicMeterRegistry extends StepMeterRegistry {
         StringBuilder tagsJson = new StringBuilder();
 
         for (Tag tag : getConventionTags(id)) {
-            tagsJson.append(",\"").append(tag.getKey()).append("\":\"").append(tag.getValue()).append("\"");
+            tagsJson.append(",\"").append(escapeJson(tag.getKey())).append("\":\"").append(escapeJson(tag.getValue())).append("\"");
         }
 
         NamingConvention convention = config().namingConvention();
         for (Tag tag : extraTags) {
-            tagsJson.append(",\"").append(convention.tagKey(tag.getKey())).append("\":\"").append(convention.tagValue(tag.getValue())).append("\"");
+            tagsJson.append(",\"").append(escapeJson(convention.tagKey(tag.getKey())))
+                    .append("\":\"").append(escapeJson(convention.tagValue(tag.getValue()))).append("\"");
         }
 
         return Arrays.stream(attributes)
                 .map(attr -> ",\"" + attr.getName() + "\":" + DoubleFormat.decimalOrWhole(attr.getValue().doubleValue()))
-                .collect(Collectors.joining("", "{\"eventType\":\"" + getConventionName(id) + "\"", tagsJson + "}"));
+                .collect(Collectors.joining("", "{\"eventType\":\"" + escapeJson(getConventionName(id)) + "\"", tagsJson + "}"));
     }
 
     private void sendEvents(String insightsEndpoint, Stream<String> events) {
@@ -194,6 +222,39 @@ public class NewRelicMeterRegistry extends StepMeterRegistry {
         return TimeUnit.SECONDS;
     }
 
+    public static class Builder {
+        private final NewRelicConfig config;
+
+        private Clock clock = Clock.SYSTEM;
+        private ThreadFactory threadFactory = DEFAULT_THREAD_FACTORY;
+        private HttpSender httpClient;
+
+        @SuppressWarnings("deprecation")
+        Builder(NewRelicConfig config) {
+            this.config = config;
+            this.httpClient = new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout());
+        }
+
+        public Builder clock(Clock clock) {
+            this.clock = clock;
+            return this;
+        }
+
+        public Builder threadFactory(ThreadFactory threadFactory) {
+            this.threadFactory = threadFactory;
+            return this;
+        }
+
+        public Builder httpClient(HttpSender httpClient) {
+            this.httpClient = httpClient;
+            return this;
+        }
+
+        public NewRelicMeterRegistry build() {
+            return new NewRelicMeterRegistry(config, clock, threadFactory, httpClient);
+        }
+    }
+
     private class Attribute {
         private final String name;
         private final Number value;
@@ -209,42 +270,6 @@ public class NewRelicMeterRegistry extends StepMeterRegistry {
 
         public Number getValue() {
             return value;
-        }
-    }
-
-    public static Builder builder(NewRelicConfig config) {
-        return new Builder(config);
-    }
-
-    public static class Builder {
-        private final NewRelicConfig config;
-
-        private Clock clock = Clock.SYSTEM;
-        private ThreadFactory threadFactory = Executors.defaultThreadFactory();
-        private HttpClient httpClient;
-
-        public Builder(NewRelicConfig config) {
-            this.config = config;
-            this.httpClient = new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout());
-        }
-
-        public Builder clock(Clock clock) {
-            this.clock = clock;
-            return this;
-        }
-
-        public Builder threadFactory(ThreadFactory threadFactory) {
-            this.threadFactory = threadFactory;
-            return this;
-        }
-
-        public Builder httpClient(HttpClient httpClient) {
-            this.httpClient = httpClient;
-            return this;
-        }
-
-        public NewRelicMeterRegistry build() {
-            return new NewRelicMeterRegistry(config, clock, threadFactory, httpClient);
         }
     }
 }

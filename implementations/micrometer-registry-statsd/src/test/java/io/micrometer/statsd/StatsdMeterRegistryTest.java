@@ -57,6 +57,21 @@ class StatsdMeterRegistryTest {
         ((Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME)).setLevel(Level.INFO);
     }
 
+    private static StatsdConfig configWithFlavor(StatsdFlavor flavor) {
+        return new StatsdConfig() {
+            @Override
+            @Nullable
+            public String get(String key) {
+                return null;
+            }
+
+            @Override
+            public StatsdFlavor flavor() {
+                return flavor;
+            }
+        };
+    }
+
     @ParameterizedTest
     @EnumSource(StatsdFlavor.class)
     void counterLineProtocol(StatsdFlavor flavor) {
@@ -360,6 +375,29 @@ class StatsdMeterRegistryTest {
     }
 
     @Test
+    @Issue("#778")
+    void doNotPublishNanOrInfiniteGaugeValues() {
+        AtomicInteger lineCount = new AtomicInteger(0);
+        MeterRegistry registry = StatsdMeterRegistry.builder(StatsdConfig.DEFAULT)
+                .lineSink(l -> lineCount.incrementAndGet())
+                .build();
+
+        AtomicReference<Double> value = new AtomicReference<>(1.0);
+        StatsdGauge<?> gauge = (StatsdGauge<?>) Gauge.builder("my.gauge", value, AtomicReference::get).register(registry);
+
+        gauge.poll();
+        assertThat(lineCount.get()).isEqualTo(1);
+
+        value.set(Double.NaN);
+        gauge.poll();
+        assertThat(lineCount.get()).isEqualTo(1);
+
+        value.set(Double.POSITIVE_INFINITY);
+        gauge.poll();
+        assertThat(lineCount.get()).isEqualTo(1);
+    }
+
+    @Test
     void stopTrackingMetersThatAreRemoved() {
         Map<String, Integer> lines = new HashMap<>();
 
@@ -432,21 +470,6 @@ class StatsdMeterRegistryTest {
         registry.remove(registry.get("functioncounter").functionCounter());
         registry.poll();
         assertThat(lines.get("functioncounter")).isEqualTo(1);
-    }
-
-    private static StatsdConfig configWithFlavor(StatsdFlavor flavor) {
-        return new StatsdConfig() {
-            @Override
-            @Nullable
-            public String get(String key) {
-                return null;
-            }
-
-            @Override
-            public StatsdFlavor flavor() {
-                return flavor;
-            }
-        };
     }
 
     private UnicastProcessor<String> lineProcessor() {

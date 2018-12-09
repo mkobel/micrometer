@@ -15,6 +15,7 @@
  */
 package io.micrometer.core.instrument.binder.kafka;
 
+import io.micrometer.core.annotation.Incubating;
 import io.micrometer.core.instrument.*;
 import io.micrometer.core.instrument.binder.MeterBinder;
 import io.micrometer.core.lang.NonNullApi;
@@ -27,31 +28,41 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
+import java.util.function.ToDoubleFunction;
 
 import static java.util.Collections.emptyList;
 
 /**
- * Kafka consumer metrics collected from metrics exposed by {@see org.apache.kafka.clients.consumer.KafkaConsumer}
- * via the MBeanServer. Metrics are exposed at each consumer thread.
+ * Kafka consumer metrics collected from metrics exposed by Kafka consumers via the MBeanServer. Metrics are exposed
+ * at each consumer thread.
  * <p>
- * Metric names here are based on the naming scheme as it was last changed in Kafka version 0.11.0. Metric for earlier
+ * Metric names here are based on the naming scheme as it was last changed in Kafka version 0.11.0. Metrics for earlier
  * versions of Kafka will not report correctly.
  *
  * @author Wardha Perinkadakattu
  * @author Jon Schneider
- * @link https://docs.confluent.io/current/kafka/monitoring.html
+ * @author Johnny Lim
+ * @see <a href="https://docs.confluent.io/current/kafka/monitoring.html">Kakfa monitoring documentation</a>
+ * @since 1.1.0
  */
+@Incubating(since = "1.1.0")
 @NonNullApi
 @NonNullFields
 public class KafkaConsumerMetrics implements MeterBinder {
+    private static final String JMX_DOMAIN = "kafka.consumer";
+    private static final String METRIC_NAME_PREFIX = "kafka.consumer.";
 
     private final MBeanServer mBeanServer;
 
     private final Iterable<Tag> tags;
 
+    @Nullable
+    private Integer kafkaMajorVersion;
+
     public KafkaConsumerMetrics() {
-        this(getMBeanServer(), emptyList());
+        this(emptyList());
     }
 
     public KafkaConsumerMetrics(Iterable<Tag> tags) {
@@ -59,8 +70,8 @@ public class KafkaConsumerMetrics implements MeterBinder {
     }
 
     public KafkaConsumerMetrics(MBeanServer mBeanServer, Iterable<Tag> tags) {
-        this.tags = tags;
         this.mBeanServer = mBeanServer;
+        this.tags = tags;
     }
 
     private static MBeanServer getMBeanServer() {
@@ -74,15 +85,14 @@ public class KafkaConsumerMetrics implements MeterBinder {
     @Override
     public void bindTo(MeterRegistry registry) {
         registerMetricsEventually("consumer-fetch-manager-metrics", (o, tags) -> {
-
             registerGaugeForObject(registry, o, "records-lag-max", tags, "The maximum lag in terms of number of records for any partition in this window. An increasing value over time is your best indication that the consumer group is not keeping up with the producers.", "records");
             registerGaugeForObject(registry, o, "fetch-size-avg", tags, "The average number of bytes fetched per request.", "bytes");
             registerGaugeForObject(registry, o, "fetch-size-max", tags, "The maximum number of bytes fetched per request.", "bytes");
             registerGaugeForObject(registry, o, "records-per-request-avg", tags, "The average number of records in each request.", "records");
 
             registerFunctionCounterForObject(registry, o, "fetch-total", tags, "The number of fetch requests.", "requests");
-            registerFunctionCounterForObject(registry, o, "bytes-consumed-total", tags, "The average number of bytes consumed.", "bytes");
-            registerFunctionCounterForObject(registry, o, "records-consumed-total", tags, "The average number of records consumed.", "records");
+            registerFunctionCounterForObject(registry, o, "bytes-consumed-total", tags, "The total number of bytes consumed.", "bytes");
+            registerFunctionCounterForObject(registry, o, "records-consumed-total", tags, "The total number of records consumed.", "records");
 
             if (kafkaMajorVersion(tags) >= 2) {
                 // KAFKA-6184
@@ -114,8 +124,8 @@ public class KafkaConsumerMetrics implements MeterBinder {
 
         registerMetricsEventually("consumer-metrics", (o, tags) -> {
             registerGaugeForObject(registry, o, "connection-count", tags, "The current number of active connections.", "connections");
-            registerGaugeForObject(registry, o, "connections-creation-total", tags, "New connections established.", "connections");
-            registerGaugeForObject(registry, o, "connections-close-total", tags, "Connections closed.", "connections");
+            registerGaugeForObject(registry, o, "connection-creation-total", tags, "New connections established.", "connections");
+            registerGaugeForObject(registry, o, "connection-close-total", tags, "Connections closed.", "connections");
             registerGaugeForObject(registry, o, "io-ratio", tags, "The fraction of time the I/O thread spent doing I/O.", null);
             registerGaugeForObject(registry, o, "io-wait-ratio", tags, "The fraction of time the I/O thread spent waiting.", null);
             registerGaugeForObject(registry, o, "select-total", tags, "Number of times the I/O layer checked for new I/O to perform.", null);
@@ -125,9 +135,9 @@ public class KafkaConsumerMetrics implements MeterBinder {
 
             if (kafkaMajorVersion(tags) >= 2) {
                 registerGaugeForObject(registry, o, "successful-authentication-total", "authentication-attempts",
-                        Tags.concat(tags, "result", "successful"), "The number of authentication attempts.", "");
+                        Tags.concat(tags, "result", "successful"), "The number of successful authentication attempts.", null);
                 registerGaugeForObject(registry, o, "failed-authentication-total", "authentication-attempts",
-                        Tags.concat(tags, "result", "failed"), "The number of authentication attempts.", "");
+                        Tags.concat(tags, "result", "failed"), "The number of failed authentication attempts.", null);
 
                 registerGaugeForObject(registry, o, "network-io-total", tags, "", "bytes");
                 registerGaugeForObject(registry, o, "outgoing-byte-total", tags, "", "bytes");
@@ -141,53 +151,73 @@ public class KafkaConsumerMetrics implements MeterBinder {
     }
 
     private void registerGaugeForObject(MeterRegistry registry, ObjectName o, String jmxMetricName, String meterName, Tags allTags, String description, @Nullable String baseUnit) {
-        Gauge.builder("kafka.consumer." + meterName, mBeanServer, s -> safeDouble(() -> s.getAttribute(o, jmxMetricName)))
+        final AtomicReference<Gauge> gauge = new AtomicReference<>();
+        gauge.set(Gauge
+                .builder(METRIC_NAME_PREFIX + meterName, mBeanServer,
+                        getJmxAttribute(registry, gauge, o, jmxMetricName))
                 .description(description)
                 .baseUnit(baseUnit)
                 .tags(allTags)
-                .register(registry);
+                .register(registry));
     }
 
     private void registerGaugeForObject(MeterRegistry registry, ObjectName o, String jmxMetricName, Tags allTags, String description, @Nullable String baseUnit) {
-        registerGaugeForObject(registry, o, jmxMetricName, jmxMetricName.replaceAll("-", "."), allTags, description, baseUnit);
+        registerGaugeForObject(registry, o, jmxMetricName, sanitize(jmxMetricName), allTags, description, baseUnit);
     }
 
     private void registerFunctionCounterForObject(MeterRegistry registry, ObjectName o, String jmxMetricName, Tags allTags, String description, @Nullable String baseUnit) {
-        FunctionCounter.builder("kafka.consumer." + jmxMetricName.replaceAll("-", "."), mBeanServer, s -> safeDouble(() -> s.getAttribute(o, jmxMetricName)))
+        final AtomicReference<FunctionCounter> counter = new AtomicReference<>();
+        counter.set(FunctionCounter
+                .builder(METRIC_NAME_PREFIX + sanitize(jmxMetricName), mBeanServer,
+                        getJmxAttribute(registry, counter, o, jmxMetricName))
                 .description(description)
                 .baseUnit(baseUnit)
                 .tags(allTags)
-                .register(registry);
+                .register(registry));
     }
 
     private void registerTimeGaugeForObject(MeterRegistry registry, ObjectName o, String jmxMetricName, String meterName, Tags allTags, String description) {
-        TimeGauge.builder("kafka.consumer." + meterName, mBeanServer, TimeUnit.MILLISECONDS,
-                s -> safeDouble(() -> s.getAttribute(o, jmxMetricName)))
+        final AtomicReference<TimeGauge> timeGauge = new AtomicReference<>();
+        timeGauge.set(TimeGauge.builder(METRIC_NAME_PREFIX + meterName, mBeanServer, TimeUnit.MILLISECONDS,
+                getJmxAttribute(registry, timeGauge, o, jmxMetricName))
                 .description(description)
                 .tags(allTags)
-                .register(registry);
+                .register(registry));
+    }
+
+    private ToDoubleFunction<MBeanServer> getJmxAttribute(MeterRegistry registry, AtomicReference<? extends Meter> meter,
+                                                          ObjectName o, String jmxMetricName) {
+        return s -> safeDouble(jmxMetricName, () -> {
+            if (!s.isRegistered(o)) {
+                registry.remove(meter.get());
+            }
+            return s.getAttribute(o, jmxMetricName);
+        });
     }
 
     private void registerTimeGaugeForObject(MeterRegistry registry, ObjectName o, String jmxMetricName, Tags allTags, String description) {
-        registerTimeGaugeForObject(registry, o, jmxMetricName, jmxMetricName.replaceAll("-", "."), allTags, description);
+        registerTimeGaugeForObject(registry, o, jmxMetricName, sanitize(jmxMetricName), allTags, description);
     }
 
     int kafkaMajorVersion(Tags tags) {
-        return tags.stream().filter(t -> "client.id".equals(t.getKey())).findAny()
-                .map(clientId -> {
-                    try {
-                        String version = (String) mBeanServer.getAttribute(new ObjectName("kafka.consumer:type=app-info,client-id=" + clientId.getValue()), "version");
-                        return Integer.parseInt(version.substring(0, version.indexOf('.')));
-                    } catch (Throwable e) {
-                        return -1; // should never happen
-                    }
-                })
-                .orElse(-1);
+        if (kafkaMajorVersion == null) {
+            kafkaMajorVersion = tags.stream().filter(t -> "client.id".equals(t.getKey())).findAny()
+                    .map(clientId -> {
+                        try {
+                            String version = (String) mBeanServer.getAttribute(new ObjectName(JMX_DOMAIN + ":type=app-info,client-id=" + clientId.getValue()), "version");
+                            return Integer.parseInt(version.substring(0, version.indexOf('.')));
+                        } catch (Throwable e) {
+                            return -1; // should never happen
+                        }
+                    })
+                    .orElse(-1);
+        }
+        return kafkaMajorVersion;
     }
 
     private void registerMetricsEventually(String type, BiConsumer<ObjectName, Tags> perObject) {
         try {
-            Set<ObjectName> objs = mBeanServer.queryNames(new ObjectName("kafka.consumer:type=" + type + ",*"), null);
+            Set<ObjectName> objs = mBeanServer.queryNames(new ObjectName(JMX_DOMAIN + ":type=" + type + ",*"), null);
             if (!objs.isEmpty()) {
                 for (ObjectName o : objs) {
                     perObject.accept(o, Tags.concat(tags, nameTag(o)));
@@ -198,6 +228,16 @@ public class KafkaConsumerMetrics implements MeterBinder {
             throw new RuntimeException("Error registering Kafka JMX based metrics", e);
         }
 
+        registerNotificationListener(type, perObject);
+    }
+
+    /**
+     * This notification listener should remain indefinitely since new Kafka consumers can be added at any time.
+     *
+     * @param type      The Kafka JMX type to listen for.
+     * @param perObject Metric registration handler when a new MBean is created.
+     */
+    private void registerNotificationListener(String type, BiConsumer<ObjectName, Tags> perObject) {
         NotificationListener notificationListener = (notification, handback) -> {
             MBeanServerNotification mbs = (MBeanServerNotification) notification;
             ObjectName o = mbs.getMBeanName();
@@ -208,7 +248,8 @@ public class KafkaConsumerMetrics implements MeterBinder {
             if (!MBeanServerNotification.REGISTRATION_NOTIFICATION.equals(notification.getType()))
                 return false;
             ObjectName obj = ((MBeanServerNotification) notification).getMBeanName();
-            return obj.getDomain().equals("kafka.consumer") && obj.getKeyProperty("type").equals(type);
+            return obj.getDomain().equals(JMX_DOMAIN) && obj.getKeyProperty("type").equals(type) &&
+                    obj.getKeyProperty("partition") == null && obj.getKeyProperty("topic") == null;
         };
 
         try {
@@ -218,7 +259,7 @@ public class KafkaConsumerMetrics implements MeterBinder {
         }
     }
 
-    private double safeDouble(Callable<Object> callable) {
+    private double safeDouble(String jmxMetricName, Callable<Object> callable) {
         try {
             return Double.parseDouble(callable.call().toString());
         } catch (Exception e) {
@@ -229,14 +270,15 @@ public class KafkaConsumerMetrics implements MeterBinder {
     private Iterable<Tag> nameTag(ObjectName name) {
         Tags tags = Tags.empty();
 
-        if (name.getKeyProperty("client-id") != null) {
-            tags = Tags.concat(tags, "client.id", name.getKeyProperty("client-id"));
-        }
-
-        if (name.getKeyProperty("topic") != null) {
-            tags = Tags.concat(tags, "topic", name.getKeyProperty("topic"));
+        String clientId = name.getKeyProperty("client-id");
+        if (clientId != null) {
+            tags = Tags.concat(tags, "client.id", clientId);
         }
 
         return tags;
+    }
+
+    private static String sanitize(String value) {
+        return value.replaceAll("-", ".");
     }
 }

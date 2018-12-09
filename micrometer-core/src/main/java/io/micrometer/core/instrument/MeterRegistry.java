@@ -54,10 +54,10 @@ import static java.util.Objects.requireNonNull;
  *
  * @author Jon Schneider
  */
-public abstract class MeterRegistry implements AutoCloseable {
+public abstract class MeterRegistry {
     protected final Clock clock;
     private final Object meterMapLock = new Object();
-    private final List<MeterFilter> filters = new CopyOnWriteArrayList<>();
+    private volatile MeterFilter[] filters = new MeterFilter[0];
     private final List<Consumer<Meter>> meterAddedListeners = new CopyOnWriteArrayList<>();
     private final List<Consumer<Meter>> meterRemovedListeners = new CopyOnWriteArrayList<>();
     private final Config config = new Config();
@@ -597,8 +597,15 @@ public abstract class MeterRegistry implements AutoCloseable {
     }
 
     private boolean accept(Meter.Id id) {
-        return this.filters.stream()
-                .noneMatch((filter) -> filter.accept(id) == MeterFilterReply.DENY);
+        for (MeterFilter filter : filters) {
+            MeterFilterReply reply = filter.accept(id);
+            if (reply == MeterFilterReply.DENY) {
+                return false;
+            } else if (reply == MeterFilterReply.ACCEPT) {
+                return true;
+            }
+        }
+        return true;
     }
 
     /**
@@ -685,8 +692,11 @@ public abstract class MeterRegistry implements AutoCloseable {
          * @param filter The filter to add to the registry.
          * @return This configuration instance.
          */
-        public Config meterFilter(MeterFilter filter) {
-            filters.add(filter);
+        public synchronized Config meterFilter(MeterFilter filter) {
+            MeterFilter[] newFilters = new MeterFilter[filters.length + 1];
+            System.arraycopy(filters, 0, newFilters, 0, filters.length);
+            newFilters[filters.length] = filter;
+            filters = newFilters;
             return this;
         }
 
@@ -918,7 +928,6 @@ public abstract class MeterRegistry implements AutoCloseable {
      * Closes this registry, releasing any resources in the process. Once closed, this registry will no longer
      * accept new meters and any publishing activity will cease.
      */
-    @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
             synchronized (meterMapLock) {

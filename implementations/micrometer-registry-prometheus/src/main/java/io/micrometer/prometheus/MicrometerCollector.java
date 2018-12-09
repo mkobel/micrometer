@@ -21,7 +21,7 @@ import io.micrometer.core.instrument.config.NamingConvention;
 import io.prometheus.client.Collector;
 
 import java.util.*;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
 import static java.util.stream.Collectors.toList;
@@ -30,6 +30,53 @@ import static java.util.stream.Collectors.toList;
  * @author Jon Schneider
  */
 class MicrometerCollector extends Collector {
+    private final Meter.Id id;
+    private final Map<List<String>, Child> children = new ConcurrentHashMap<>();
+    private final String conventionName;
+    private final List<String> tagKeys;
+    private final PrometheusConfig config;
+
+    public MicrometerCollector(Meter.Id id, NamingConvention convention, PrometheusConfig config) {
+        this.id = id;
+        this.conventionName = id.getConventionName(convention);
+        this.tagKeys = id.getConventionTags(convention).stream().map(Tag::getKey).collect(toList());
+        this.config = config;
+    }
+
+    public void add(List<String> tagValues, Child child) {
+        children.put(tagValues, child);
+    }
+
+    public void remove(List<String> tagValues) {
+        children.remove(tagValues);
+    }
+
+    public boolean isEmpty() {
+        return children.isEmpty();
+    }
+
+    public List<String> getTagKeys() {
+        return tagKeys;
+    }
+
+    @Override
+    public List<MetricFamilySamples> collect() {
+        final String help = config.descriptions() ? Optional.ofNullable(id.getDescription()).orElse(" ") : " ";
+
+        Map<String, Family> families = new HashMap<>();
+
+        for (Child child : children.values()) {
+            child.samples(conventionName, tagKeys).forEach(family -> {
+                families.compute(family.getConventionName(), (name, matchingFamily) -> matchingFamily != null ?
+                        matchingFamily.addSamples(family.samples) : family);
+            });
+        }
+
+        return families.values().stream()
+                .map(family -> new MetricFamilySamples(family.conventionName, family.type, help, family.samples))
+                .collect(toList());
+    }
+
     interface Child {
         Stream<Family> samples(String conventionName, List<String> tagKeys);
     }
@@ -59,44 +106,5 @@ class MicrometerCollector extends Collector {
             this.samples.addAll(samples);
             return this;
         }
-    }
-
-    private final Meter.Id id;
-    private final List<Child> children = new CopyOnWriteArrayList<>();
-    private final String conventionName;
-    private final List<String> tagKeys;
-    private final PrometheusConfig config;
-
-    public MicrometerCollector(Meter.Id id, NamingConvention convention, PrometheusConfig config) {
-        this.id = id;
-        this.conventionName = id.getConventionName(convention);
-        this.tagKeys = id.getConventionTags(convention).stream().map(Tag::getKey).collect(toList());
-        this.config = config;
-    }
-
-    public void add(Child child) {
-        children.add(child);
-    }
-
-    public List<String> getTagKeys() {
-        return tagKeys;
-    }
-
-    @Override
-    public List<MetricFamilySamples> collect() {
-        final String help = config.descriptions() ? Optional.ofNullable(id.getDescription()).orElse(" ") : " ";
-
-        Map<String, Family> families = new HashMap<>();
-
-        for (Child child : children) {
-            child.samples(conventionName, tagKeys).forEach(family -> {
-                families.compute(family.getConventionName(), (name, matchingFamily) -> matchingFamily != null ?
-                        matchingFamily.addSamples(family.samples) : family);
-            });
-        }
-
-        return families.values().stream()
-                .map(family -> new MetricFamilySamples(family.conventionName, family.type, help, family.samples))
-                .collect(toList());
     }
 }

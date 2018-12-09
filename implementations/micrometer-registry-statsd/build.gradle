@@ -29,6 +29,7 @@ shadowJar {
     relocate 'reactor', 'io.micrometer.shaded.reactor'
     relocate 'org.reactivestreams', 'io.micrometer.shaded.org.reactorstreams'
     relocate 'io.netty', 'io.micrometer.shaded.io.netty'
+    relocate 'META-INF/native/libnetty', 'META-INF/native/libio_micrometer_shaded_netty'
     relocate 'org.pcollections', 'io.micrometer.shaded.statsd.org.pcollections'
 }
 
@@ -43,9 +44,9 @@ publishing {
                         .dependencies
                         .dependency
                         .findAll {
-                            ['reactor-core', 'reactor-netty', 'pcollections'].contains(it.artifactId.text())
-                        }
-                        .each { it.parent().remove(it) }
+                    ['reactor-core', 'reactor-netty', 'pcollections'].contains(it.artifactId.text())
+                }
+                .each { it.parent().remove(it) }
             }
         }
     }

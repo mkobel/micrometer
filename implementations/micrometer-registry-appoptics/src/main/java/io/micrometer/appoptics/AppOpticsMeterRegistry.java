@@ -20,21 +20,22 @@ import io.micrometer.core.instrument.config.MeterFilter;
 import io.micrometer.core.instrument.distribution.HistogramSnapshot;
 import io.micrometer.core.instrument.step.StepMeterRegistry;
 import io.micrometer.core.instrument.util.MeterPartition;
-import io.micrometer.core.ipc.http.HttpClient;
-import io.micrometer.core.ipc.http.HttpUrlConnectionClient;
+import io.micrometer.core.instrument.util.NamedThreadFactory;
+import io.micrometer.core.instrument.util.TimeUtils;
+import io.micrometer.core.ipc.http.HttpSender;
+import io.micrometer.core.ipc.http.HttpUrlConnectionSender;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.StreamSupport;
 
-import static io.micrometer.core.instrument.Meter.Type.match;
 import static io.micrometer.core.instrument.util.DoubleFormat.decimal;
+import static io.micrometer.core.instrument.util.StringEscapeUtils.escapeJson;
 import static java.util.stream.Collectors.joining;
 
 /**
@@ -44,19 +45,22 @@ import static java.util.stream.Collectors.joining;
  * @author Jon Schneider
  */
 public class AppOpticsMeterRegistry extends StepMeterRegistry {
+    private static final ThreadFactory DEFAULT_THREAD_FACTORY = new NamedThreadFactory("appoptics-metrics-publisher");
+
     private final Logger logger = LoggerFactory.getLogger(AppOpticsMeterRegistry.class);
 
     private final AppOpticsConfig config;
-    private final HttpClient httpClient;
+    private final HttpSender httpClient;
 
+    @SuppressWarnings("deprecation")
     public AppOpticsMeterRegistry(AppOpticsConfig config, Clock clock) {
-        this(config, clock, Executors.defaultThreadFactory(), new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout()));
+        this(config, clock, DEFAULT_THREAD_FACTORY, new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
     }
 
-    private AppOpticsMeterRegistry(AppOpticsConfig config, Clock clock, ThreadFactory threadFactory, HttpClient httpClient) {
+    private AppOpticsMeterRegistry(AppOpticsConfig config, Clock clock, ThreadFactory threadFactory, HttpSender httpClient) {
         super(config, clock);
 
-        this.config().namingConvention(new AppOpticsNamingConvention());
+        config().namingConvention(new AppOpticsNamingConvention());
 
         this.config = config;
         this.httpClient = httpClient;
@@ -71,8 +75,19 @@ public class AppOpticsMeterRegistry extends StepMeterRegistry {
             }
         });
 
-        if (config.enabled())
-            start(threadFactory);
+        start(threadFactory);
+    }
+
+    public static Builder builder(AppOpticsConfig config) {
+        return new Builder(config);
+    }
+
+    @Override
+    public void start(ThreadFactory threadFactory) {
+        if (config.enabled()) {
+            logger.info("publishing metrics to appoptics every " + TimeUtils.format(config.step()));
+        }
+        super.start(threadFactory);
     }
 
     @Override
@@ -83,7 +98,7 @@ public class AppOpticsMeterRegistry extends StepMeterRegistry {
                         .withBasicAuthentication(config.apiToken(), "")
                         .withJsonContent(
                                 batch.stream()
-                                        .map(meter -> match(meter,
+                                        .map(meter -> meter.match(
                                                 this::writeGauge,
                                                 this::writeCounter,
                                                 this::writeTimer,
@@ -190,15 +205,16 @@ public class AppOpticsMeterRegistry extends StepMeterRegistry {
 
     private String write(Meter.Id id, @Nullable String type, String... statistics) {
         StringBuilder sb = new StringBuilder();
-        sb.append("{\"name\":\"").append(getConventionName(id)).append("\",\"period\":").append(config.step().getSeconds());
+        sb.append("{\"name\":\"").append(escapeJson(getConventionName(id))).append("\",\"period\":").append(config.step().getSeconds());
 
-        if (!"value".equals(statistics[0])) {
+        if (!"value" .equals(statistics[0])) {
             sb.append(",\"attributes\":{\"aggregate\":false}");
         }
 
         for (int i = 0; i < statistics.length; i += 2) {
             sb.append(",\"").append(statistics[i]).append("\":").append(statistics[i + 1]);
         }
+
         List<Tag> tags = id.getTags();
 
         sb.append(",\"tags\":{");
@@ -216,13 +232,18 @@ public class AppOpticsMeterRegistry extends StepMeterRegistry {
                         if (key.equals(config.hostTag())) {
                             key = "host_hostname_alias";
                         }
-                        return "\"" + config().namingConvention().tagKey(key) + "\":\"" +
-                                config().namingConvention().tagValue(tag.getValue()) + "\"";
+                        return "\"" + config().namingConvention().tagKey(escapeJson(key)) + "\":\"" +
+                                config().namingConvention().tagValue(escapeJson(tag.getValue())) + "\"";
                     })
                     .collect(joining(",")));
         }
         sb.append("}}");
         return sb.toString();
+    }
+
+    @Override
+    protected TimeUnit getBaseTimeUnit() {
+        return TimeUnit.MILLISECONDS;
     }
 
     /**
@@ -242,25 +263,17 @@ public class AppOpticsMeterRegistry extends StepMeterRegistry {
         }
     }
 
-    @Override
-    protected TimeUnit getBaseTimeUnit() {
-        return TimeUnit.MILLISECONDS;
-    }
-
-    public static Builder builder(AppOpticsConfig config) {
-        return new Builder(config);
-    }
-
     public static class Builder {
         private final AppOpticsConfig config;
 
         private Clock clock = Clock.SYSTEM;
-        private ThreadFactory threadFactory = Executors.defaultThreadFactory();
-        private HttpClient httpClient;
+        private ThreadFactory threadFactory = DEFAULT_THREAD_FACTORY;
+        private HttpSender httpClient;
 
+        @SuppressWarnings("deprecation")
         Builder(AppOpticsConfig config) {
             this.config = config;
-            this.httpClient = new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout());
+            this.httpClient = new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout());
         }
 
         public Builder clock(Clock clock) {
@@ -273,7 +286,7 @@ public class AppOpticsMeterRegistry extends StepMeterRegistry {
             return this;
         }
 
-        public Builder httpClient(HttpClient httpClient) {
+        public Builder httpClient(HttpSender httpClient) {
             this.httpClient = httpClient;
             return this;
         }

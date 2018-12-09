@@ -17,46 +17,61 @@ package io.micrometer.kairos;
 
 import io.micrometer.core.instrument.*;
 import io.micrometer.core.instrument.step.StepMeterRegistry;
+import io.micrometer.core.instrument.util.DoubleFormat;
 import io.micrometer.core.instrument.util.MeterPartition;
-import io.micrometer.core.ipc.http.HttpClient;
-import io.micrometer.core.ipc.http.HttpUrlConnectionClient;
+import io.micrometer.core.instrument.util.NamedThreadFactory;
+import io.micrometer.core.instrument.util.TimeUtils;
+import io.micrometer.core.ipc.http.HttpSender;
+import io.micrometer.core.ipc.http.HttpUrlConnectionSender;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.List;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
-import static io.micrometer.core.instrument.Meter.Type.match;
+import static io.micrometer.core.instrument.util.StringEscapeUtils.escapeJson;
 
 /**
  * @author Anton Ilinchik
  */
 public class KairosMeterRegistry extends StepMeterRegistry {
+    private static final ThreadFactory DEFAULT_THREAD_FACTORY = new NamedThreadFactory("kairos-metrics-publisher");
     private final Logger logger = LoggerFactory.getLogger(KairosMeterRegistry.class);
     private final KairosConfig config;
-    private final HttpClient httpClient;
+    private final HttpSender httpClient;
 
+    @SuppressWarnings("deprecation")
     public KairosMeterRegistry(KairosConfig config, Clock clock) {
-        this(config, clock, Executors.defaultThreadFactory(), new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout()));
+        this(config, clock, DEFAULT_THREAD_FACTORY, new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
     }
 
-    private KairosMeterRegistry(KairosConfig config, Clock clock, ThreadFactory threadFactory, HttpClient httpClient) {
+    private KairosMeterRegistry(KairosConfig config, Clock clock, ThreadFactory threadFactory, HttpSender httpClient) {
         super(config, clock);
 
-        this.config().namingConvention(new KairosNamingConvention());
+        config().namingConvention(new KairosNamingConvention());
 
         this.config = config;
         this.httpClient = httpClient;
 
-        if (config.enabled())
-            start(threadFactory);
+        start(threadFactory);
+    }
+
+    public static Builder builder(KairosConfig config) {
+        return new Builder(config);
+    }
+
+    @Override
+    public void start(ThreadFactory threadFactory) {
+        if (config.enabled()) {
+            logger.info("publishing metrics to kairos every " + TimeUtils.format(config.step()));
+        }
+        super.start(threadFactory);
     }
 
     @Override
@@ -66,7 +81,7 @@ public class KairosMeterRegistry extends StepMeterRegistry {
                 httpClient.post(config.uri())
                         .withBasicAuthentication(config.userName(), config.password())
                         .withJsonContent(
-                                batch.stream().flatMap(m -> match(m,
+                                batch.stream().flatMap(m -> m.match(
                                         this::writeGauge,
                                         this::writeCounter,
                                         this::writeTimer,
@@ -78,53 +93,12 @@ public class KairosMeterRegistry extends StepMeterRegistry {
                                         this::writeCustomMetric)
                                 ).collect(Collectors.joining(",", "[", "]"))
                         )
-                        .print()
                         .send()
                         .onSuccess(response -> logger.debug("successfully sent {} metrics to kairos.", batch.size()))
                         .onError(response -> logger.error("failed to send metrics to kairos: {}", response.body()));
             } catch (Throwable t) {
                 logger.warn("failed to send metrics to kairos", t);
             }
-        }
-    }
-
-    private static class KairosMetricBuilder {
-        private StringBuilder sb = new StringBuilder("{");
-
-        KairosMetricBuilder field(String key, String value) {
-            if (sb.length() > 1) {
-                sb.append(',');
-            }
-            sb.append('\"').append(key).append("\":\"").append(value).append('\"');
-            return this;
-        }
-
-        KairosMetricBuilder datapoints(Long wallTime, Number value) {
-            sb.append(",\"datapoints\":[[").append(wallTime).append(',').append(value).append("]]");
-            return this;
-        }
-
-        KairosMetricBuilder tags(List<Tag> tags) {
-            KairosMetricBuilder tagBuilder = new KairosMetricBuilder();
-            if (tags.isEmpty()) {
-                // tags field is required for KairosDB, use hostname as a default tag
-                try {
-                    tagBuilder.field("hostname", InetAddress.getLocalHost().getHostName());
-                } catch (UnknownHostException ignore) {
-                    /* ignore */
-                }
-            } else {
-                for (Tag tag : tags) {
-                    tagBuilder.field(tag.getKey(), tag.getValue());
-                }
-            }
-
-            sb.append(",\"tags\":").append(tagBuilder.build());
-            return this;
-        }
-
-        String build() {
-            return sb.append('}').toString();
         }
     }
 
@@ -167,12 +141,12 @@ public class KairosMeterRegistry extends StepMeterRegistry {
 
     Stream<String> writeGauge(Gauge gauge) {
         Double value = gauge.value();
-        return value.isNaN() ? Stream.empty() : Stream.of(writeMetric(gauge.getId(), config().clock().wallTime(), value));
+        return (value.isNaN() || value.isInfinite()) ? Stream.empty() : Stream.of(writeMetric(gauge.getId(), config().clock().wallTime(), value));
     }
 
     Stream<String> writeTimeGauge(TimeGauge timeGauge) {
         Double value = timeGauge.value(getBaseTimeUnit());
-        return value.isNaN() ? Stream.empty() : Stream.of(writeMetric(timeGauge.getId(), config().clock().wallTime(), value));
+        return (value.isNaN() || value.isInfinite()) ? Stream.empty() : Stream.of(writeMetric(timeGauge.getId(), config().clock().wallTime(), value));
     }
 
     Stream<String> writeLongTaskTimer(LongTaskTimer timer) {
@@ -193,7 +167,7 @@ public class KairosMeterRegistry extends StepMeterRegistry {
                         .build());
     }
 
-    String writeMetric(Meter.Id id, long wallTime, Number value) {
+    String writeMetric(Meter.Id id, long wallTime, double value) {
         return new KairosMetricBuilder()
                 .field("name", getConventionName(id))
                 .datapoints(wallTime, value)
@@ -210,20 +184,57 @@ public class KairosMeterRegistry extends StepMeterRegistry {
         return TimeUnit.MILLISECONDS;
     }
 
-    public static Builder builder(KairosConfig config) {
-        return new Builder(config);
+    private static class KairosMetricBuilder {
+        private StringBuilder sb = new StringBuilder("{");
+
+        KairosMetricBuilder field(String key, String value) {
+            if (sb.length() > 1) {
+                sb.append(',');
+            }
+            sb.append('\"').append(escapeJson(key)).append("\":\"").append(escapeJson(value)).append('\"');
+            return this;
+        }
+
+        KairosMetricBuilder datapoints(Long wallTime, double value) {
+            sb.append(",\"datapoints\":[[").append(wallTime).append(',').append(DoubleFormat.decimalOrWhole(value)).append("]]");
+            return this;
+        }
+
+        KairosMetricBuilder tags(List<Tag> tags) {
+            KairosMetricBuilder tagBuilder = new KairosMetricBuilder();
+            if (tags.isEmpty()) {
+                // tags field is required for KairosDB, use hostname as a default tag
+                try {
+                    tagBuilder.field("hostname", InetAddress.getLocalHost().getHostName());
+                } catch (UnknownHostException ignore) {
+                    /* ignore */
+                }
+            } else {
+                for (Tag tag : tags) {
+                    tagBuilder.field(tag.getKey(), tag.getValue());
+                }
+            }
+
+            sb.append(",\"tags\":").append(tagBuilder.build());
+            return this;
+        }
+
+        String build() {
+            return sb.append('}').toString();
+        }
     }
 
     public static class Builder {
         private final KairosConfig config;
 
         private Clock clock = Clock.SYSTEM;
-        private ThreadFactory threadFactory = Executors.defaultThreadFactory();
-        private HttpClient httpClient;
+        private ThreadFactory threadFactory = DEFAULT_THREAD_FACTORY;
+        private HttpSender httpClient;
 
-        public Builder(KairosConfig config) {
+        @SuppressWarnings("deprecation")
+        Builder(KairosConfig config) {
             this.config = config;
-            this.httpClient = new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout());
+            this.httpClient = new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout());
         }
 
         public Builder clock(Clock clock) {
@@ -236,7 +247,7 @@ public class KairosMeterRegistry extends StepMeterRegistry {
             return this;
         }
 
-        public Builder httpClient(HttpClient httpClient) {
+        public Builder httpClient(HttpSender httpClient) {
             this.httpClient = httpClient;
             return this;
         }

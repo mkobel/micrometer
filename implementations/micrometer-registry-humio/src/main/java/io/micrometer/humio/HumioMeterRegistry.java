@@ -20,9 +20,10 @@ import io.micrometer.core.instrument.distribution.HistogramSnapshot;
 import io.micrometer.core.instrument.step.StepMeterRegistry;
 import io.micrometer.core.instrument.util.DoubleFormat;
 import io.micrometer.core.instrument.util.MeterPartition;
-import io.micrometer.core.ipc.http.HttpClient;
-import io.micrometer.core.ipc.http.HttpRequest;
-import io.micrometer.core.ipc.http.HttpUrlConnectionClient;
+import io.micrometer.core.instrument.util.NamedThreadFactory;
+import io.micrometer.core.instrument.util.TimeUtils;
+import io.micrometer.core.ipc.http.HttpSender;
+import io.micrometer.core.ipc.http.HttpUrlConnectionSender;
 import io.micrometer.core.lang.NonNull;
 import io.micrometer.core.lang.Nullable;
 import org.slf4j.Logger;
@@ -32,12 +33,11 @@ import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.StreamSupport;
 
-import static io.micrometer.core.instrument.Meter.Type.match;
+import static io.micrometer.core.instrument.util.StringEscapeUtils.escapeJson;
 import static java.util.stream.Collectors.joining;
 
 /**
@@ -45,33 +45,49 @@ import static java.util.stream.Collectors.joining;
  * @author Jon Schneider
  */
 public class HumioMeterRegistry extends StepMeterRegistry {
-
+    private static final ThreadFactory DEFAULT_THREAD_FACTORY = new NamedThreadFactory("humio-metrics-publisher");
     private final Logger logger = LoggerFactory.getLogger(HumioMeterRegistry.class);
 
     private final HumioConfig config;
-    private final HttpClient httpClient;
+    private final HttpSender httpClient;
 
+    @SuppressWarnings("deprecation")
     public HumioMeterRegistry(HumioConfig config, Clock clock) {
-        this(config, clock, Executors.defaultThreadFactory(), new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout()));
+        this(config, clock, DEFAULT_THREAD_FACTORY, new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
     }
 
-    private HumioMeterRegistry(HumioConfig config, Clock clock, ThreadFactory threadFactory, HttpClient httpClient) {
+    private HumioMeterRegistry(HumioConfig config, Clock clock, ThreadFactory threadFactory, HttpSender httpClient) {
         super(config, clock);
 
-        this.config().namingConvention(new HumioNamingConvention());
+        config().namingConvention(new HumioNamingConvention());
 
         this.config = config;
         this.httpClient = httpClient;
 
-        if (config.enabled())
-            start(threadFactory);
+        start(threadFactory);
+    }
+
+    private static Attribute event(String name, double value) {
+        return new Attribute(name, value);
+    }
+
+    public static Builder builder(HumioConfig config) {
+        return new Builder(config);
+    }
+
+    @Override
+    public void start(ThreadFactory threadFactory) {
+        if (config.enabled()) {
+            logger.info("publishing metrics to humio every " + TimeUtils.format(config.step()));
+        }
+        super.start(threadFactory);
     }
 
     @Override
     protected void publish() {
         for (List<Meter> meters : MeterPartition.partition(this, config.batchSize())) {
             try {
-                HttpRequest.Builder post = httpClient.post(config.uri() + "/api/v1/dataspaces/" + config.repository() + "/ingest");
+                HttpSender.Request.Builder post = httpClient.post(config.uri() + "/api/v1/dataspaces/" + config.repository() + "/ingest");
                 String token = config.apiToken();
                 if (token != null) {
                     post.withHeader("Authorization", "Bearer " + token);
@@ -87,7 +103,7 @@ public class HumioMeterRegistry extends StepMeterRegistry {
                 }
 
                 post.withJsonContent(meters.stream()
-                        .map(m -> match(m,
+                        .map(m -> m.match(
                                 batch::writeGauge,
                                 batch::writeCounter,
                                 batch::writeTimer,
@@ -105,6 +121,55 @@ public class HumioMeterRegistry extends StepMeterRegistry {
             } catch (Throwable e) {
                 logger.warn("failed to send metrics to humio", e);
             }
+        }
+    }
+
+    @Override
+    @NonNull
+    protected TimeUnit getBaseTimeUnit() {
+        return TimeUnit.MILLISECONDS;
+    }
+
+    private static class Attribute {
+        private final String name;
+        private final double value;
+
+        private Attribute(String name, double value) {
+            this.name = name;
+            this.value = value;
+        }
+    }
+
+    public static class Builder {
+        private final HumioConfig config;
+
+        private Clock clock = Clock.SYSTEM;
+        private ThreadFactory threadFactory = DEFAULT_THREAD_FACTORY;
+        private HttpSender httpClient;
+
+        @SuppressWarnings("deprecation")
+        Builder(HumioConfig config) {
+            this.config = config;
+            this.httpClient = new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout());
+        }
+
+        public Builder clock(Clock clock) {
+            this.clock = clock;
+            return this;
+        }
+
+        public Builder threadFactory(ThreadFactory threadFactory) {
+            this.threadFactory = threadFactory;
+            return this;
+        }
+
+        public Builder httpClient(HttpSender httpClient) {
+            this.httpClient = httpClient;
+            return this;
+        }
+
+        public HumioMeterRegistry build() {
+            return new HumioMeterRegistry(config, clock, threadFactory, httpClient);
         }
     }
 
@@ -201,7 +266,9 @@ public class HumioMeterRegistry extends StepMeterRegistry {
 
             String name = getConventionName(meter.getId());
 
-            sb.append("{\"timestamp\":\"").append(timestamp).append("\",\"attributes\":{\"name\":\"").append(name).append('"');
+            sb.append("{\"timestamp\":\"").append(timestamp).append("\",\"attributes\":{\"name\":\"")
+                    .append(escapeJson(name)).append('"');
+
             for (Attribute attribute : attributes) {
                 sb.append(",\"").append(attribute.name).append("\":").append(DoubleFormat.decimalOrWhole(attribute.value));
             }
@@ -216,67 +283,11 @@ public class HumioMeterRegistry extends StepMeterRegistry {
                     }
                 }
 
-                sb.append(",\"").append(key).append("\":\"").append(tag.getValue()).append('"');
+                sb.append(",\"").append(escapeJson(key)).append("\":\"").append(escapeJson(tag.getValue())).append('"');
             }
 
             sb.append("}}");
             return sb.toString();
-        }
-    }
-
-    private static class Attribute {
-        private final String name;
-        private final double value;
-
-        private Attribute(String name, double value) {
-            this.name = name;
-            this.value = value;
-        }
-    }
-
-    private static Attribute event(String name, double value) {
-        return new Attribute(name, value);
-    }
-
-    @Override
-    @NonNull
-    protected TimeUnit getBaseTimeUnit() {
-        return TimeUnit.MILLISECONDS;
-    }
-
-    public static Builder builder(HumioConfig config) {
-        return new Builder(config);
-    }
-
-    public static class Builder {
-        private final HumioConfig config;
-
-        private Clock clock = Clock.SYSTEM;
-        private ThreadFactory threadFactory = Executors.defaultThreadFactory();
-        private HttpClient httpClient;
-
-        public Builder(HumioConfig config) {
-            this.config = config;
-            this.httpClient = new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout());
-        }
-
-        public Builder clock(Clock clock) {
-            this.clock = clock;
-            return this;
-        }
-
-        public Builder threadFactory(ThreadFactory threadFactory) {
-            this.threadFactory = threadFactory;
-            return this;
-        }
-
-        public Builder httpClient(HttpClient httpClient) {
-            this.httpClient = httpClient;
-            return this;
-        }
-
-        public HumioMeterRegistry build() {
-            return new HumioMeterRegistry(config, clock, threadFactory, httpClient);
         }
     }
 }

@@ -18,8 +18,10 @@ package io.micrometer.elastic;
 import io.micrometer.core.instrument.*;
 import io.micrometer.core.instrument.step.StepMeterRegistry;
 import io.micrometer.core.instrument.util.MeterPartition;
-import io.micrometer.core.ipc.http.HttpClient;
-import io.micrometer.core.ipc.http.HttpUrlConnectionClient;
+import io.micrometer.core.instrument.util.NamedThreadFactory;
+import io.micrometer.core.instrument.util.TimeUtils;
+import io.micrometer.core.ipc.http.HttpSender;
+import io.micrometer.core.ipc.http.HttpUrlConnectionSender;
 import io.micrometer.core.lang.NonNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,14 +30,14 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Date;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
-import static io.micrometer.core.instrument.Meter.Type.match;
+import static io.micrometer.core.instrument.util.StringEscapeUtils.escapeJson;
 import static java.util.stream.Collectors.joining;
 
 /**
@@ -43,6 +45,7 @@ import static java.util.stream.Collectors.joining;
  * @author Jon Schneider
  */
 public class ElasticMeterRegistry extends StepMeterRegistry {
+    private static final ThreadFactory DEFAULT_THREAD_FACTORY = new NamedThreadFactory("elastic-metrics-publisher");
     static final DateTimeFormatter FORMATTER = DateTimeFormatter.ISO_INSTANT;
     private static final String ES_METRICS_TEMPLATE = "/_template/metrics_template";
     private static final String INDEX_LINE = "{ \"index\" : {} }\n";
@@ -50,21 +53,34 @@ public class ElasticMeterRegistry extends StepMeterRegistry {
     private final Logger logger = LoggerFactory.getLogger(ElasticMeterRegistry.class);
 
     private final ElasticConfig config;
-    private final HttpClient httpClient;
+    private final HttpSender httpClient;
 
     private boolean checkedForIndexTemplate = false;
 
+    @SuppressWarnings("deprecation")
     public ElasticMeterRegistry(ElasticConfig config, Clock clock) {
-        this(config, clock, Executors.defaultThreadFactory(),
-                new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout()));
+        this(config, clock, DEFAULT_THREAD_FACTORY,
+                new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
     }
 
-    private ElasticMeterRegistry(ElasticConfig config, Clock clock, ThreadFactory threadFactory, HttpClient httpClient) {
+    private ElasticMeterRegistry(ElasticConfig config, Clock clock, ThreadFactory threadFactory, HttpSender httpClient) {
         super(config, clock);
-        this.config().namingConvention(new ElasticNamingConvention());
+        config().namingConvention(new ElasticNamingConvention());
         this.config = config;
         this.httpClient = httpClient;
         start(threadFactory);
+    }
+
+    public static Builder builder(ElasticConfig config) {
+        return new Builder(config);
+    }
+
+    @Override
+    public void start(ThreadFactory threadFactory) {
+        if (config.enabled()) {
+            logger.info("publishing metrics to elastic every " + TimeUtils.format(config.step()));
+        }
+        super.start(threadFactory);
     }
 
     private void createIndexIfNeeded() {
@@ -77,7 +93,11 @@ public class ElasticMeterRegistry extends StepMeterRegistry {
                     .head(config.host() + ES_METRICS_TEMPLATE)
                     .withBasicAuthentication(config.userName(), config.password())
                     .send()
-                    .onError(response -> logger.error("could not connect to elastic: HTTP {}", response.code()))
+                    .onError(response -> {
+                        if (response.code() != 404) {
+                            logger.error("could not create index in elastic (HTTP {})", response.code(), response.body());
+                        }
+                    })
                     .isSuccessful()) {
                 checkedForIndexTemplate = true;
                 logger.debug("metrics template already exists");
@@ -90,7 +110,7 @@ public class ElasticMeterRegistry extends StepMeterRegistry {
                     .send()
                     .onError(response -> logger.error("failed to add metrics template to elastic", response.body()));
         } catch (Throwable e) {
-            logger.error("could not connect to elastic", e);
+            logger.error("could not create index in elastic", e);
             return;
         }
 
@@ -101,16 +121,13 @@ public class ElasticMeterRegistry extends StepMeterRegistry {
     protected void publish() {
         createIndexIfNeeded();
 
-        ZonedDateTime dt = ZonedDateTime.ofInstant(Instant.ofEpochMilli(config().clock().wallTime()), ZoneOffset.UTC);
-        String indexName = config.index() + "-" + DateTimeFormatter.ofPattern(config.indexDateFormat()).format(dt);
-
         for (List<Meter> batch : MeterPartition.partition(this, config.batchSize())) {
             try {
                 httpClient
-                        .post(config.host() + "/" + indexName + "/doc/_bulk")
+                        .post(config.host() + "/" + indexName() + "/doc/_bulk")
                         .withBasicAuthentication(config.userName(), config.password())
                         .withJsonContent(batch.stream()
-                                .map(m -> match(m,
+                                .map(m -> m.match(
                                         this::writeGauge,
                                         this::writeCounter,
                                         this::writeTimer,
@@ -131,7 +148,7 @@ public class ElasticMeterRegistry extends StepMeterRegistry {
                             if (body.contains("\"errors\":true")) {
                                 logger.error("failed to send metrics to elastic: {}", body);
                             } else {
-                                logger.debug("successfully sent {} metrics to Elasticsearch.", batch.size());
+                                logger.debug("successfully sent {} metrics to elastic", batch.size());
                             }
                         })
                         .onError(response -> logger.error("failed to send metrics to elastic: {}", response.body()));
@@ -139,6 +156,11 @@ public class ElasticMeterRegistry extends StepMeterRegistry {
                 logger.error("failed to send metrics to elastic", e);
             }
         }
+    }
+
+    private String indexName() {
+        ZonedDateTime dt = ZonedDateTime.ofInstant(new Date(config().clock().wallTime()).toInstant(), ZoneOffset.UTC);
+        return config.index() + "-" + DateTimeFormatter.ofPattern(config.indexDateFormat()).format(dt);
     }
 
     // VisibleForTesting
@@ -231,12 +253,13 @@ public class ElasticMeterRegistry extends StepMeterRegistry {
         String name = getConventionName(meter.getId());
         String type = meter.getId().getType().toString().toLowerCase();
         sb.append("{\"").append(config.timestampFieldName()).append("\":\"").append(timestamp).append('"')
-                .append(",\"name\":\"").append(name).append('"')
+                .append(",\"name\":\"").append(escapeJson(name)).append('"')
                 .append(",\"type\":\"").append(type).append('"');
 
         List<Tag> tags = getConventionTags(meter.getId());
         for (Tag tag : tags) {
-            sb.append(",\"").append(tag.getKey()).append("\":\"").append(tag.getValue()).append('"');
+            sb.append(",\"").append(escapeJson(tag.getKey())).append("\":\"")
+                    .append(escapeJson(tag.getValue())).append('"');
         }
 
         consumer.accept(sb);
@@ -251,20 +274,17 @@ public class ElasticMeterRegistry extends StepMeterRegistry {
         return TimeUnit.MILLISECONDS;
     }
 
-    public static Builder builder(ElasticConfig config) {
-        return new Builder(config);
-    }
-
     public static class Builder {
         private final ElasticConfig config;
 
         private Clock clock = Clock.SYSTEM;
-        private ThreadFactory threadFactory = Executors.defaultThreadFactory();
-        private HttpClient httpClient;
+        private ThreadFactory threadFactory = DEFAULT_THREAD_FACTORY;
+        private HttpSender httpClient;
 
-        public Builder(ElasticConfig config) {
+        @SuppressWarnings("deprecation")
+        Builder(ElasticConfig config) {
             this.config = config;
-            this.httpClient = new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout());
+            this.httpClient = new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout());
         }
 
         public Builder clock(Clock clock) {
@@ -277,7 +297,7 @@ public class ElasticMeterRegistry extends StepMeterRegistry {
             return this;
         }
 
-        public Builder httpClient(HttpClient httpClient) {
+        public Builder httpClient(HttpSender httpClient) {
             this.httpClient = httpClient;
             return this;
         }

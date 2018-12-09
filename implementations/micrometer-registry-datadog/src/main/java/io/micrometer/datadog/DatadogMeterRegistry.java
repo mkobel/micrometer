@@ -18,8 +18,10 @@ package io.micrometer.datadog;
 import io.micrometer.core.instrument.*;
 import io.micrometer.core.instrument.step.StepMeterRegistry;
 import io.micrometer.core.instrument.util.MeterPartition;
-import io.micrometer.core.ipc.http.HttpClient;
-import io.micrometer.core.ipc.http.HttpUrlConnectionClient;
+import io.micrometer.core.instrument.util.NamedThreadFactory;
+import io.micrometer.core.instrument.util.TimeUtils;
+import io.micrometer.core.ipc.http.HttpSender;
+import io.micrometer.core.ipc.http.HttpUrlConnectionSender;
 import io.micrometer.core.lang.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,12 +32,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
-import static io.micrometer.core.instrument.Meter.Type.match;
+import static io.micrometer.core.instrument.util.StringEscapeUtils.escapeJson;
 import static java.util.Objects.requireNonNull;
 import static java.util.stream.Collectors.joining;
 import static java.util.stream.StreamSupport.stream;
@@ -44,24 +45,38 @@ import static java.util.stream.StreamSupport.stream;
  * @author Jon Schneider
  */
 public class DatadogMeterRegistry extends StepMeterRegistry {
+    private static final ThreadFactory DEFAULT_THREAD_FACTORY = new NamedThreadFactory("datadog-metrics-publisher");
     private final Logger logger = LoggerFactory.getLogger(DatadogMeterRegistry.class);
     private final DatadogConfig config;
-    private final HttpClient httpClient;
+    private final HttpSender httpClient;
 
     /**
      * Metric names for which we have posted metadata concerning type and base unit
      */
     private final Set<String> verifiedMetadata = ConcurrentHashMap.newKeySet();
 
+    /**
+     * @param config Configuration options for the registry that are describable as properties.
+     * @param clock  The clock to use for timings.
+     */
+    @SuppressWarnings("deprecation")
     public DatadogMeterRegistry(DatadogConfig config, Clock clock) {
-        this(config, clock, Executors.defaultThreadFactory());
+        this(config, clock, DEFAULT_THREAD_FACTORY,
+                new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
     }
 
+    /**
+     * @param config        Configuration options for the registry that are describable as properties.
+     * @param clock         The clock to use for timings.
+     * @param threadFactory The thread factory to use to create the publishing thread.
+     * @deprecated Use {@link #builder(DatadogConfig)} instead.
+     */
+    @Deprecated
     public DatadogMeterRegistry(DatadogConfig config, Clock clock, ThreadFactory threadFactory) {
-        this(config, clock, threadFactory, new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout()));
+        this(config, clock, threadFactory, new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
     }
 
-    private DatadogMeterRegistry(DatadogConfig config, Clock clock, ThreadFactory threadFactory, HttpClient httpClient) {
+    private DatadogMeterRegistry(DatadogConfig config, Clock clock, ThreadFactory threadFactory, HttpSender httpClient) {
         super(config, clock);
         requireNonNull(config.apiKey());
 
@@ -70,8 +85,15 @@ public class DatadogMeterRegistry extends StepMeterRegistry {
         this.config = config;
         this.httpClient = httpClient;
 
-        if (config.enabled())
-            start(threadFactory);
+        start(threadFactory);
+    }
+
+    @Override
+    public void start(ThreadFactory threadFactory) {
+        if (config.enabled()) {
+            logger.info("publishing metrics to datadog every " + TimeUtils.format(config.step()));
+        }
+        super.start(threadFactory);
     }
 
     @Override
@@ -92,19 +114,23 @@ public class DatadogMeterRegistry extends StepMeterRegistry {
                         ]
                 }"
                 */
+                String body = batch.stream().flatMap(meter -> meter.match(
+                        m -> writeMeter(m, metadataToSend),
+                        m -> writeMeter(m, metadataToSend),
+                        timer -> writeTimer(timer, metadataToSend),
+                        summary -> writeSummary(summary, metadataToSend),
+                        m -> writeMeter(m, metadataToSend),
+                        m -> writeMeter(m, metadataToSend),
+                        m -> writeMeter(m, metadataToSend),
+                        timer -> writeTimer(timer, metadataToSend),
+                        m -> writeMeter(m, metadataToSend))
+                ).collect(joining(",", "{\"series\":[", "]}"));
+
+                logger.trace("sending metrics batch to datadog:\n{}", body);
+
                 httpClient.post(datadogEndpoint)
                         .withJsonContent(
-                                batch.stream().flatMap(meter -> match(meter,
-                                        m -> writeMeter(m, metadataToSend),
-                                        m -> writeMeter(m, metadataToSend),
-                                        timer -> writeTimer(timer, metadataToSend),
-                                        summary -> writeSummary(summary, metadataToSend),
-                                        m -> writeMeter(m, metadataToSend),
-                                        m -> writeMeter(m, metadataToSend),
-                                        m -> writeMeter(m, metadataToSend),
-                                        timer -> writeTimer(timer, metadataToSend),
-                                        m -> writeMeter(m, metadataToSend))
-                                ).collect(joining(",", "{\"series\":[", "]}")))
+                                body)
                         .send()
                         .onSuccess(response -> logger.debug("successfully sent {} metrics to datadog", batch.size()))
                         .onError(response -> logger.error("failed to send metrics to datadog: {}", response.body()));
@@ -204,16 +230,16 @@ public class DatadogMeterRegistry extends StepMeterRegistry {
         String host = config.hostTag() == null ? "" : stream(tags.spliterator(), false)
                 .filter(t -> requireNonNull(config.hostTag()).equals(t.getKey()))
                 .findAny()
-                .map(t -> ",\"host\":\"" + t.getValue() + "\"")
+                .map(t -> ",\"host\":\"" + escapeJson(t.getValue()) + "\"")
                 .orElse("");
 
         String tagsArray = tags.iterator().hasNext()
                 ? stream(tags.spliterator(), false)
-                .map(t -> "\"" + t.getKey() + ":" + t.getValue() + "\"")
+                .map(t -> "\"" + escapeJson(t.getKey()) + ":" + escapeJson(t.getValue()) + "\"")
                 .collect(joining(",", ",\"tags\":[", "]"))
                 : "";
 
-        return "{\"metric\":\"" + getConventionName(fullId) + "\"," +
+        return "{\"metric\":\"" + escapeJson(getConventionName(fullId)) + "\"," +
                 "\"points\":[[" + (wallTime / 1000) + ", " + value + "]]" + host + tagsArray + "}";
     }
 
@@ -255,11 +281,8 @@ public class DatadogMeterRegistry extends StepMeterRegistry {
         return TimeUnit.MILLISECONDS;
     }
 
-    /**
-     * Copy tags, unit, and description from an existing id, but change the name.
-     */
     private Meter.Id idWithSuffix(Meter.Id id, String suffix) {
-        return new Meter.Id(id.getName() + "." + suffix, id.getTags(), id.getBaseUnit(), id.getDescription(), id.getType());
+        return id.withName(id.getName() + "." + suffix);
     }
 
     public static Builder builder(DatadogConfig config) {
@@ -270,12 +293,13 @@ public class DatadogMeterRegistry extends StepMeterRegistry {
         private final DatadogConfig config;
 
         private Clock clock = Clock.SYSTEM;
-        private ThreadFactory threadFactory = Executors.defaultThreadFactory();
-        private HttpClient httpClient;
+        private ThreadFactory threadFactory = DEFAULT_THREAD_FACTORY;
+        private HttpSender httpClient;
 
-        public Builder(DatadogConfig config) {
+        @SuppressWarnings("deprecation")
+        Builder(DatadogConfig config) {
             this.config = config;
-            this.httpClient = new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout());
+            this.httpClient = new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout());
         }
 
         public Builder clock(Clock clock) {
@@ -288,7 +312,7 @@ public class DatadogMeterRegistry extends StepMeterRegistry {
             return this;
         }
 
-        public Builder httpClient(HttpClient httpClient) {
+        public Builder httpClient(HttpSender httpClient) {
             this.httpClient = httpClient;
             return this;
         }

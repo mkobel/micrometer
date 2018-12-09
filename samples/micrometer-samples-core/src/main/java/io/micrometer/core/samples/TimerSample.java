@@ -27,6 +27,7 @@ import reactor.core.publisher.Flux;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class TimerSample {
     public static void main(String[] args) {
@@ -39,7 +40,9 @@ public class TimerSample {
                 .distributionStatisticBufferLength(3)
                 .register(registry);
 
-        FunctionTimer.builder("ftimer", timer, Timer::count, t -> t.totalTime(TimeUnit.SECONDS), TimeUnit.SECONDS)
+        AtomicLong totalCount = new AtomicLong();
+        AtomicLong totalTime = new AtomicLong();
+        FunctionTimer.builder("ftimer", totalCount, t -> totalCount.get(), t -> totalTime.get(), TimeUnit.MILLISECONDS)
                 .register(registry);
 
         RandomEngine r = new MersenneTwister64(0);
@@ -57,7 +60,10 @@ public class TimerSample {
                     if (incomingRequests.nextDouble() + 0.4 > 0) {
                         // pretend the request took some amount of time, such that the time is
                         // distributed normally with a mean of 250ms
-                        timer.record(latencyForThisSecond.get(), TimeUnit.MILLISECONDS);
+                        int latency = latencyForThisSecond.get();
+                        timer.record(latency, TimeUnit.MILLISECONDS);
+                        totalTime.addAndGet(latency);
+                        totalCount.incrementAndGet();
                     }
                 })
                 .blockLast();

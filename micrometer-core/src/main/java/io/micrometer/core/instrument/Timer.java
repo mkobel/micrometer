@@ -24,9 +24,7 @@ import io.micrometer.core.instrument.distribution.pause.PauseDetector;
 import io.micrometer.core.lang.Nullable;
 
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -45,11 +43,12 @@ public interface Timer extends Meter, HistogramSupport {
      * @since 1.1.0
      */
     static Sample start() {
-        return new Sample(Clock.SYSTEM);
+        return start(Clock.SYSTEM);
     }
 
     /**
      * Start a timing sample.
+     * @param registry a meter registry to be used
      * @return A timing sample with start time recorded.
      */
     static Sample start(MeterRegistry registry) {
@@ -58,6 +57,7 @@ public interface Timer extends Meter, HistogramSupport {
 
     /**
      * Start a timing sample.
+     * @param clock a clock to be used
      * @return A timing sample with start time recorded.
      */
     static Sample start(Clock clock) {
@@ -90,7 +90,7 @@ public interface Timer extends Meter, HistogramSupport {
     }
 
     /**
-     * Updates the statistics kept by the counter with the specified amount.
+     * Updates the statistics kept by the timer with the specified amount.
      *
      * @param amount Duration of a single event being measured by this timer. If the amount is less than 0
      *               the value will be dropped.
@@ -99,7 +99,7 @@ public interface Timer extends Meter, HistogramSupport {
     void record(long amount, TimeUnit unit);
 
     /**
-     * Updates the statistics kept by the counter with the specified amount.
+     * Updates the statistics kept by the timer with the specified amount.
      *
      * @param duration Duration of a single event being measured by this timer.
      */
@@ -261,7 +261,7 @@ public interface Timer extends Meter, HistogramSupport {
      */
     class Builder {
         private final String name;
-        private final List<Tag> tags = new ArrayList<>();
+        private Tags tags = Tags.empty();
         private final DistributionStatisticConfig.Builder distributionConfigBuilder;
 
         @Nullable
@@ -286,21 +286,21 @@ public interface Timer extends Meter, HistogramSupport {
         }
 
         /**
-         * @param tags Tags to add to the eventual meter.
+         * @param tags Tags to add to the eventual timer.
          * @return The timer builder with added tags.
          */
         public Builder tags(Iterable<Tag> tags) {
-            tags.forEach(this.tags::add);
+            this.tags = this.tags.and(tags);
             return this;
         }
 
         /**
          * @param key   The tag key.
          * @param value The tag value.
-         * @return This builder.
+         * @return The timer builder with a single added tag.
          */
         public Builder tag(String key, String value) {
-            tags.add(Tag.of(key, value));
+            this.tags = tags.and(key, value);
             return this;
         }
 

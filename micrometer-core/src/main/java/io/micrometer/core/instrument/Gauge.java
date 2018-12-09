@@ -19,9 +19,7 @@ import io.micrometer.core.annotation.Incubating;
 import io.micrometer.core.instrument.distribution.HistogramGauges;
 import io.micrometer.core.lang.Nullable;
 
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.List;
 import java.util.function.Supplier;
 import java.util.function.ToDoubleFunction;
 
@@ -38,6 +36,7 @@ public interface Gauge extends Meter {
      *             is determined from.
      * @param f    A function that yields a double value for the gauge, based on the state of
      *             {@code obj}.
+     * @param <T>  The type of object to gauge.
      * @return A new gauge builder.
      */
     static <T> Builder<T> builder(String name, @Nullable T obj, ToDoubleFunction<T> f) {
@@ -54,8 +53,11 @@ public interface Gauge extends Meter {
      * @since 1.1.0
      */
     @Incubating(since = "1.1.0")
-    static Builder<Supplier<Double>> builder(String name, Supplier<Double> f) {
-        return new Builder<>(name, f, Supplier::get).strongReference(true);
+    static Builder<Supplier<Number>> builder(String name, Supplier<Number> f) {
+        return new Builder<>(name, f, f2 -> {
+            Number val = f2.get();
+            return val == null ? Double.NaN : val.doubleValue();
+        }).strongReference(true);
     }
 
     /**
@@ -79,7 +81,7 @@ public interface Gauge extends Meter {
     class Builder<T> {
         private final String name;
         private final ToDoubleFunction<T> f;
-        private final List<Tag> tags = new ArrayList<>();
+        private Tags tags = Tags.empty();
         private boolean strongReference = false;
 
         @Nullable
@@ -109,11 +111,11 @@ public interface Gauge extends Meter {
         }
 
         /**
-         * @param tags Tags to add to the eventual meter.
+         * @param tags Tags to add to the eventual gauge.
          * @return The gauge builder with added tags.
          */
         public Builder<T> tags(Iterable<Tag> tags) {
-            tags.forEach(this.tags::add);
+            this.tags = this.tags.and(tags);
             return this;
         }
 
@@ -123,7 +125,7 @@ public interface Gauge extends Meter {
          * @return The gauge builder with a single added tag.
          */
         public Builder<T> tag(String key, String value) {
-            tags.add(Tag.of(key, value));
+            this.tags = tags.and(key, value);
             return this;
         }
 
@@ -153,7 +155,8 @@ public interface Gauge extends Meter {
          * This method may be removed in future minor or major releases if we find a way to mark derivatives in a
          * private way that does not have other API compatibility consequences.
          *
-         * @return The meter id of a meter for which this metric is a synthetic derivative.
+         * @param syntheticAssociation The meter id of a meter for which this metric is a synthetic derivative.
+         * @return The gauge builder with added base unit.
          */
         @Incubating(since = "1.1.0")
         public Builder<T> synthetic(Meter.Id syntheticAssociation) {
@@ -165,6 +168,8 @@ public interface Gauge extends Meter {
          * Indicates that the gauge should maintain a strong reference on the object upon which
          * its instantaneous value is determined.
          *
+         * @param strong Whether or not to maintain a strong reference on the gauged object.
+         * @return The gauge builder with added base unit.
          * @since 1.1.0
          */
         @Incubating(since = "1.1.0")

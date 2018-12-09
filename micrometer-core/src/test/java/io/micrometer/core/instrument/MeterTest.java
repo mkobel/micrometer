@@ -15,10 +15,12 @@
  */
 package io.micrometer.core.instrument;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.TimeUnit;
+
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.mock;
 
 /**
  * Tests for {@link Meter}.
@@ -26,11 +28,12 @@ import static org.mockito.Mockito.mock;
  * @author Johnny Lim
  */
 class MeterTest {
+    TimeGauge gauge = TimeGauge.builder("time.gauge", null, TimeUnit.MILLISECONDS, o -> 1.0)
+            .register(new SimpleMeterRegistry());
 
     @Test
     void matchWhenTimeGaugeShouldUseFunctionForTimeGauge() {
-        String matched = Meter.Type.match(
-                mock(TimeGauge.class),
+        String matched = gauge.match(
                 (gauge) -> "gauge",
                 (counter) -> "counter",
                 (timer) -> "timer",
@@ -44,20 +47,19 @@ class MeterTest {
     }
 
     @Test
-    void consumeWhenTimeGaugeShouldUseConsumerForTimeGauge() {
-        StringBuilder consumed = new StringBuilder();
-        Meter.Type.consume(
-                mock(TimeGauge.class),
-                (gauge) -> consumed.append("gauge"),
-                (counter) -> consumed.append("counter"),
-                (timer) -> consumed.append("timer"),
-                (distributionSummary) -> consumed.append("distributionSummary"),
-                (longTaskTimer) -> consumed.append("longTaskTimer"),
-                (timeGauge) -> consumed.append("timeGauge"),
-                (functionCounter) -> consumed.append("functionCounter"),
-                (functionTimer) -> consumed.append("functionTimer"),
-                (meter) -> consumed.append("meter"));
-        assertThat(consumed.toString()).isEqualTo("timeGauge");
+    void useWhenTimeGaugeShouldUseConsumerForTimeGauge() {
+        StringBuilder used = new StringBuilder();
+        gauge.use(
+                (gauge) -> used.append("gauge"),
+                (counter) -> used.append("counter"),
+                (timer) -> used.append("timer"),
+                (distributionSummary) -> used.append("distributionSummary"),
+                (longTaskTimer) -> used.append("longTaskTimer"),
+                (timeGauge) -> used.append("timeGauge"),
+                (functionCounter) -> used.append("functionCounter"),
+                (functionTimer) -> used.append("functionTimer"),
+                (meter) -> used.append("meter"));
+        assertThat(used.toString()).isEqualTo("timeGauge");
     }
 
 }

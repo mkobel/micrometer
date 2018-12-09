@@ -22,15 +22,17 @@ import com.microsoft.applicationinsights.telemetry.SeverityLevel;
 import com.microsoft.applicationinsights.telemetry.TraceTelemetry;
 import io.micrometer.core.instrument.*;
 import io.micrometer.core.instrument.step.StepMeterRegistry;
+import io.micrometer.core.instrument.util.NamedThreadFactory;
 import io.micrometer.core.instrument.util.StringUtils;
+import io.micrometer.core.instrument.util.TimeUtils;
 import io.micrometer.core.lang.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
-import static io.micrometer.core.instrument.Meter.Type.match;
 import static java.util.stream.StreamSupport.stream;
 
 /**
@@ -40,35 +42,52 @@ import static java.util.stream.StreamSupport.stream;
  * @author Jon Schneider
  */
 public class AzureMonitorMeterRegistry extends StepMeterRegistry {
+    private static final ThreadFactory DEFAULT_THREAD_FACTORY = new NamedThreadFactory("azure-metrics-publisher");
     private static final String SDKTELEMETRY_SYNTHETIC_SOURCENAME = "SDKTelemetry";
     private static final String SDK_VERSION = "java:micrometer";
 
     private final Logger logger = LoggerFactory.getLogger(AzureMonitorMeterRegistry.class);
     private final TelemetryClient client;
+    private final AzureMonitorConfig config;
 
-    public AzureMonitorMeterRegistry(AzureMonitorConfig config, Clock clock, @Nullable TelemetryConfiguration clientConfig) {
+    public AzureMonitorMeterRegistry(AzureMonitorConfig config, Clock clock) {
+        this(config, clock, TelemetryConfiguration.getActive(), DEFAULT_THREAD_FACTORY);
+    }
+
+    private AzureMonitorMeterRegistry(AzureMonitorConfig config, Clock clock,
+                                      TelemetryConfiguration telemetryConfiguration,
+                                      ThreadFactory threadFactory) {
         super(config, clock);
+        this.config = config;
 
         config().namingConvention(new AzureMonitorNamingConvention());
 
-        if (clientConfig == null) {
-            clientConfig = TelemetryConfiguration.getActive();
+        if (StringUtils.isEmpty(telemetryConfiguration.getInstrumentationKey())) {
+            telemetryConfiguration.setInstrumentationKey(config.instrumentationKey());
         }
 
-        if (StringUtils.isEmpty(clientConfig.getInstrumentationKey())) {
-            clientConfig.setInstrumentationKey(config.instrumentationKey());
-        }
-
-        this.client = new TelemetryClient(clientConfig);
+        this.client = new TelemetryClient(telemetryConfiguration);
         client.getContext().getInternal().setSdkVersion(SDK_VERSION);
 
-        start();
+        start(threadFactory);
+    }
+
+    public static Builder builder(AzureMonitorConfig config) {
+        return new Builder(config);
+    }
+
+    @Override
+    public void start(ThreadFactory threadFactory) {
+        if (config.enabled()) {
+            logger.info("publishing metrics to azure monitor every " + TimeUtils.format(config.step()));
+        }
+        super.start(threadFactory);
     }
 
     @Override
     protected void publish() {
         for (Meter meter : getMeters()) {
-            match(meter,
+            meter.match(
                     this::trackGauge,
                     this::trackCounter,
                     this::trackTimer,
@@ -82,8 +101,8 @@ public class AzureMonitorMeterRegistry extends StepMeterRegistry {
                 try {
                     client.track(telemetry);
                 } catch (Throwable e) {
-                    logger.warn("Failed to track metric {}", meter.getId());
-                    TraceTelemetry traceTelemetry = new TraceTelemetry("Failed to track metric " + meter.getId());
+                    logger.warn("failed to track metric {} in azure monitor", meter.getId());
+                    TraceTelemetry traceTelemetry = new TraceTelemetry("failed to track metric " + meter.getId());
                     traceTelemetry.getContext().getOperation().setSyntheticSource(SDKTELEMETRY_SYNTHETIC_SOURCENAME);
                     traceTelemetry.setSeverityLevel(SeverityLevel.Warning);
                     client.trackTrace(traceTelemetry);
@@ -190,5 +209,39 @@ public class AzureMonitorMeterRegistry extends StepMeterRegistry {
     public void close() {
         client.flush();
         super.close();
+    }
+
+    public static class Builder {
+        private final AzureMonitorConfig config;
+
+        private Clock clock = Clock.SYSTEM;
+        private ThreadFactory threadFactory = DEFAULT_THREAD_FACTORY;
+
+        @Nullable
+        private TelemetryConfiguration telemetryConfiguration;
+
+        Builder(AzureMonitorConfig config) {
+            this.config = config;
+        }
+
+        public Builder clock(Clock clock) {
+            this.clock = clock;
+            return this;
+        }
+
+        public Builder threadFactory(ThreadFactory threadFactory) {
+            this.threadFactory = threadFactory;
+            return this;
+        }
+
+        public Builder telemetryConfiguration(TelemetryConfiguration telemetryConfiguration) {
+            this.telemetryConfiguration = telemetryConfiguration;
+            return this;
+        }
+
+        public AzureMonitorMeterRegistry build() {
+            return new AzureMonitorMeterRegistry(config, clock,
+                    telemetryConfiguration == null ? TelemetryConfiguration.getActive() : telemetryConfiguration, threadFactory);
+        }
     }
 }

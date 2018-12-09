@@ -18,8 +18,6 @@ package io.micrometer.core.instrument;
 import io.micrometer.core.instrument.util.TimeUtils;
 import io.micrometer.core.lang.Nullable;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.function.ToDoubleFunction;
 
@@ -56,7 +54,7 @@ public interface TimeGauge extends Gauge {
         private final String name;
         private final TimeUnit fUnits;
         private final ToDoubleFunction<T> f;
-        private final List<Tag> tags = new ArrayList<>();
+        private Tags tags = Tags.empty();
 
         @Nullable
         private final T obj;
@@ -73,18 +71,18 @@ public interface TimeGauge extends Gauge {
 
         /**
          * @param tags Must be an even number of arguments representing key/value pairs of tags.
-         * @return This builder.
+         * @return This time gauge builder.
          */
         public Builder<T> tags(String... tags) {
             return tags(Tags.of(tags));
         }
 
         /**
-         * @param tags Tags to add to the eventual meter.
+         * @param tags Tags to add to the eventual time gauge.
          * @return The time gauge builder with added tags.
          */
         public Builder<T> tags(Iterable<Tag> tags) {
-            tags.forEach(this.tags::add);
+            this.tags = this.tags.and(tags);
             return this;
         }
 
@@ -94,7 +92,7 @@ public interface TimeGauge extends Gauge {
          * @return The time gauge builder with a single added tag.
          */
         public Builder<T> tag(String key, String value) {
-            tags.add(Tag.of(key, value));
+            this.tags = tags.and(key, value);
             return this;
         }
 

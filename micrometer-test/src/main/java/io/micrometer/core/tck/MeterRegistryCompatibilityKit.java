@@ -98,7 +98,7 @@ public abstract class MeterRegistryCompatibilityKit {
         Counter c = registry.counter("foo");
 
         assertThat(registry.get("foo").tags("k", "v").counter()).isSameAs(c);
-        assertThat(c.getId().getTags()).hasSize(1);
+        assertThat(c.getId().getTagsAsIterable()).hasSize(1);
     }
 
     @Test
@@ -125,6 +125,17 @@ public abstract class MeterRegistryCompatibilityKit {
                 assertThat(ms.getStatistic()).isEqualTo(Statistic.TOTAL_TIME);
                 assertThat(TimeUtils.convert(ms.getValue(), baseUnit, TimeUnit.MILLISECONDS)).isEqualTo(1);
             });
+    }
+
+    @Test
+    @DisplayName("meters with synthetics can be removed without causing deadlocks")
+    void removeMeterWithSynthetic(MeterRegistry registry) {
+        Timer timer = Timer.builder("my.timer")
+                .publishPercentiles(0.95)
+                .sla(Duration.ofMillis(10))
+                .register(registry);
+
+        registry.remove(timer);
     }
 
     @DisplayName("counters")

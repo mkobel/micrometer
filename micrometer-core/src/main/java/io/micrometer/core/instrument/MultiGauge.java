@@ -18,10 +18,9 @@ package io.micrometer.core.instrument;
 import io.micrometer.core.annotation.Incubating;
 import io.micrometer.core.lang.Nullable;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.function.ToDoubleFunction;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
@@ -56,6 +55,7 @@ public class MultiGauge {
         register(rows, false);
     }
 
+    @SuppressWarnings("unchecked")
     public void register(Iterable<Row> rows, boolean overwrite) {
         registeredRows.getAndUpdate(oldRows -> {
             // for some reason the compiler needs type assistance by creating this intermediate variable.
@@ -69,8 +69,7 @@ public class MultiGauge {
                         }
 
                         if (overwrite || !previouslyDefined) {
-                            //noinspection unchecked
-                            registry.gauge(rowId, row.obj, row.valueFunction);
+                            registry.gauge(rowId, row.obj, new StrongReferenceGaugeFunction<>(row.obj, row.valueFunction));
                         }
 
                         return rowId;
@@ -102,6 +101,17 @@ public class MultiGauge {
         public static <T> Row of(Tags uniqueTags, T obj, ToDoubleFunction<T> valueFunction) {
             return new Row<>(uniqueTags, obj, valueFunction);
         }
+
+        public static Row of(Tags uniqueTags, Number number) {
+            return new Row<>(uniqueTags, number, Number::doubleValue);
+        }
+
+        public static Row of(Tags uniqueTags, Supplier<Number> valueFunction) {
+            return new Row<>(uniqueTags, valueFunction, f -> {
+                Number value = valueFunction.get();
+                return value == null ? Double.NaN : value.doubleValue();
+            });
+        }
     }
 
     /**
@@ -109,7 +119,7 @@ public class MultiGauge {
      */
     public static class Builder {
         private final String name;
-        private final List<Tag> tags = new ArrayList<>();
+        private Tags tags = Tags.empty();
 
         @Nullable
         private String description;
@@ -130,11 +140,11 @@ public class MultiGauge {
         }
 
         /**
-         * @param tags Tags to add to the eventual meter.
+         * @param tags Tags to add to the eventual gauge.
          * @return The gauge builder with added tags.
          */
         public Builder tags(Iterable<Tag> tags) {
-            tags.forEach(this.tags::add);
+            this.tags = this.tags.and(tags);
             return this;
         }
 
@@ -144,7 +154,7 @@ public class MultiGauge {
          * @return The gauge builder with a single added tag.
          */
         public Builder tag(String key, String value) {
-            tags.add(Tag.of(key, value));
+            this.tags = tags.and(key, value);
             return this;
         }
 

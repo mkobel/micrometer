@@ -43,13 +43,14 @@ public class DatadogNamingConvention implements NamingConvention {
 
     /**
      * See: https://help.datadoghq.com/hc/en-us/articles/203764705-What-are-valid-metric-names-
-     *
+     * <p>
      * Datadog's publish API will automatically strip Unicode without replacement. It will also replace
      * all non-alphanumeric characters with '_'.
      */
     @Override
     public String name(String name, Meter.Type type, @Nullable String baseUnit) {
-        String sanitized = StringEscapeUtils.escapeJson(delegate.name(name, type, baseUnit));
+        String sanitized = StringEscapeUtils.escapeJson(delegate.name(name, type, baseUnit)
+                .replace('/', '_')); // forward slashes, even URL encoded, blow up the POST metadata API
 
         // Metrics that don't start with a letter get dropped on the floor by the Datadog publish API,
         // so we will prepend them with 'm.'.

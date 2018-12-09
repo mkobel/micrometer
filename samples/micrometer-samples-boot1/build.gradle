@@ -4,19 +4,19 @@ plugins {
 
 dependencyManagement {
     imports {
-        mavenBom 'org.springframework.boot:spring-boot-dependencies:1.5.14.RELEASE'
+        mavenBom 'org.springframework.boot:spring-boot-dependencies:1.5.17.RELEASE'
     }
     dependencies {
         // not necessary in real Boot 1.5.x apps because reactor is shaded inside the
         // published version of micrometer-registry-statsd
-        dependency 'io.projectreactor:reactor-core:3.1.4.RELEASE'
+        dependency 'io.projectreactor:reactor-core:3.2.2.RELEASE'
     }
 }
 
 dependencies {
     compile project(':micrometer-spring-legacy')
 
-    ['atlas', 'azure-monitor', 'prometheus', 'datadog', 'elastic', 'ganglia', 'graphite', 'jmx', 'influx', 'statsd', 'new-relic', 'cloudwatch', 'signalfx', 'wavefront', 'elastic', 'dynatrace', 'humio', 'appoptics'].each { sys ->
+    ['atlas', 'azure-monitor', 'prometheus', 'datadog', 'elastic', 'ganglia', 'graphite', 'jmx', 'influx', 'statsd', 'new-relic', 'cloudwatch', 'signalfx', 'wavefront', 'elastic', 'dynatrace', 'humio', 'appoptics', 'stackdriver'].each { sys ->
         compile project(":micrometer-registry-$sys")
     }
 

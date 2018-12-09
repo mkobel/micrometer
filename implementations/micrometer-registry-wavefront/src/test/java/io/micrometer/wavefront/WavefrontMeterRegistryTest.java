@@ -15,12 +15,11 @@
  */
 package io.micrometer.wavefront;
 
-import java.util.stream.Stream;
-
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MockClock;
-import io.micrometer.core.instrument.Tags;
 import org.junit.jupiter.api.Test;
+
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -30,7 +29,6 @@ import static org.assertj.core.api.Assertions.assertThat;
  * @author Johnny Lim
  */
 class WavefrontMeterRegistryTest {
-
     private final WavefrontConfig config = new WavefrontConfig() {
         @Override
         public String get(String key) {
@@ -53,17 +51,17 @@ class WavefrontMeterRegistryTest {
     @Test
     void addMetric() {
         Stream.Builder<String> metricsStreamBuilder = Stream.builder();
-        Meter.Id id = new Meter.Id("name", Tags.empty(), null, null, Meter.Type.COUNTER);
+        Meter.Id id = registry.counter("name").getId();
         registry.addMetric(metricsStreamBuilder, id, null, System.currentTimeMillis(), 1d);
         assertThat(metricsStreamBuilder.build().count()).isEqualTo(1);
     }
 
     @Test
-    void addMetricWhenNanShouldNotAdd() {
+    void addMetricWhenNanOrInfinityShouldNotAdd() {
         Stream.Builder<String> metricsStreamBuilder = Stream.builder();
-        Meter.Id id = new Meter.Id("name", Tags.empty(), null, null, Meter.Type.COUNTER);
+        Meter.Id id = registry.counter("name").getId();
         registry.addMetric(metricsStreamBuilder, id, null, System.currentTimeMillis(), Double.NaN);
+        registry.addMetric(metricsStreamBuilder, id, null, System.currentTimeMillis(), Double.POSITIVE_INFINITY);
         assertThat(metricsStreamBuilder.build().count()).isEqualTo(0);
     }
-
 }

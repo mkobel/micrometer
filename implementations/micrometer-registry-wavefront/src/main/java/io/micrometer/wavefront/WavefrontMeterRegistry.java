@@ -20,8 +20,10 @@ import io.micrometer.core.instrument.config.MissingRequiredConfigurationExceptio
 import io.micrometer.core.instrument.step.StepMeterRegistry;
 import io.micrometer.core.instrument.util.DoubleFormat;
 import io.micrometer.core.instrument.util.MeterPartition;
-import io.micrometer.core.ipc.http.HttpClient;
-import io.micrometer.core.ipc.http.HttpUrlConnectionClient;
+import io.micrometer.core.instrument.util.NamedThreadFactory;
+import io.micrometer.core.instrument.util.TimeUtils;
+import io.micrometer.core.ipc.http.HttpSender;
+import io.micrometer.core.ipc.http.HttpUrlConnectionSender;
 import io.micrometer.core.lang.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,12 +34,11 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
-import static io.micrometer.core.instrument.Meter.Type.match;
+import static io.micrometer.core.instrument.util.StringEscapeUtils.escapeJson;
 import static java.util.stream.Collectors.joining;
 import static java.util.stream.StreamSupport.stream;
 
@@ -46,19 +47,33 @@ import static java.util.stream.StreamSupport.stream;
  * @author Howard Yoo
  */
 public class WavefrontMeterRegistry extends StepMeterRegistry {
+    private static final ThreadFactory DEFAULT_THREAD_FACTORY = new NamedThreadFactory("wavefront-metrics-publisher");
     private final Logger logger = LoggerFactory.getLogger(WavefrontMeterRegistry.class);
     private final WavefrontConfig config;
-    private final HttpClient httpClient;
+    private final HttpSender httpClient;
 
+    /**
+     * @param config Configuration options for the registry that are describable as properties.
+     * @param clock  The clock to use for timings.
+     */
+    @SuppressWarnings("deprecation")
     public WavefrontMeterRegistry(WavefrontConfig config, Clock clock) {
-        this(config, clock, Executors.defaultThreadFactory());
+        this(config, clock, DEFAULT_THREAD_FACTORY,
+                new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
     }
 
+    /**
+     * @param config        Configuration options for the registry that are describable as properties.
+     * @param clock         The clock to use for timings.
+     * @param threadFactory The thread factory to use to create the publishing thread.
+     * @deprecated Use {@link #builder(WavefrontConfig)} instead.
+     */
+    @Deprecated
     public WavefrontMeterRegistry(WavefrontConfig config, Clock clock, ThreadFactory threadFactory) {
-        this(config, clock, threadFactory, new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout()));
+        this(config, clock, threadFactory, new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
     }
 
-    private WavefrontMeterRegistry(WavefrontConfig config, Clock clock, ThreadFactory threadFactory, HttpClient httpClient) {
+    private WavefrontMeterRegistry(WavefrontConfig config, Clock clock, ThreadFactory threadFactory, HttpSender httpClient) {
         super(config, clock);
         this.config = config;
         this.httpClient = httpClient;
@@ -72,9 +87,18 @@ public class WavefrontMeterRegistry extends StepMeterRegistry {
     }
 
     @Override
+    public void start(ThreadFactory threadFactory) {
+        if (config.enabled()) {
+            logger.info("publishing metrics to wavefront every " + TimeUtils.format(config.step()));
+        }
+        super.start(threadFactory);
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override
     protected void publish() {
         for (List<Meter> batch : MeterPartition.partition(this, config.batchSize())) {
-            Stream<String> stream = batch.stream().flatMap(m -> match(m,
+            Stream<String> stream = batch.stream().flatMap(m -> m.match(
                     this::writeMeter,
                     this::writeMeter,
                     this::writeTimer,
@@ -102,6 +126,7 @@ public class WavefrontMeterRegistry extends StepMeterRegistry {
                     SocketAddress endpoint = uri.getHost() != null ? new InetSocketAddress(uri.getHost(), uri.getPort()) :
                             new InetSocketAddress(InetAddress.getByName(null), uri.getPort());
                     try (Socket socket = new Socket()) {
+                        // connectTimeout should be pulled up to WavefrontConfig when it is removed elsewhere
                         socket.connect(endpoint, (int) this.config.connectTimeout().toMillis());
                         try (OutputStreamWriter writer = new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8)) {
                             writer.write(stream.collect(joining("\n")) + "\n");
@@ -181,7 +206,7 @@ public class WavefrontMeterRegistry extends StepMeterRegistry {
 
     // VisibleForTesting
     void addMetric(Stream.Builder<String> metrics, Meter.Id id, @Nullable String suffix, long wallTime, double value) {
-        if (!Double.isNaN(value)) {
+        if (!Double.isNaN(value) && !Double.isInfinite(value)) {
             metrics.add(writeMetric(id, suffix, wallTime, value));
         }
     }
@@ -221,7 +246,7 @@ public class WavefrontMeterRegistry extends StepMeterRegistry {
 
         String tags = conventionTags
                 .stream()
-                .map(t -> "\"" + t.getKey() + "\": \"" + t.getValue() + "\"")
+                .map(t -> "\"" + escapeJson(t.getKey()) + "\": \"" + escapeJson(t.getValue()) + "\"")
                 .collect(joining(","));
 
         UUID uuid = UUID.randomUUID();
@@ -230,18 +255,15 @@ public class WavefrontMeterRegistry extends StepMeterRegistry {
         // To be valid JSON, the metric name must be unique. Since the same name can occur in multiple entries because of
         // variance in tag values, we need to append a suffix to the name. The suffix must be numeric, or Wavefront interprets
         // it as part of the name. Wavefront strips a $<NUMERIC> suffix from the name at parsing time.
-        return "\"" + getConventionName(fullId) + "$" + uniqueNameSuffix + "\"" +
+        return "\"" + escapeJson(getConventionName(fullId)) + "$" + uniqueNameSuffix + "\"" +
                 ": {" +
                 "\"value\": " + DoubleFormat.decimalOrNan(value) + "," +
                 "\"tags\": {" + tags + "}" +
                 "}";
     }
 
-    /**
-     * Copy tags, unit, and description from an existing id, but change the name.
-     */
     private Meter.Id idWithSuffix(Meter.Id id, String suffix) {
-        return new Meter.Id(id.getName() + "." + suffix, id.getTags(), id.getBaseUnit(), id.getDescription(), id.getType());
+        return id.withName(id.getName() + "." + suffix);
     }
 
     @Override
@@ -257,12 +279,13 @@ public class WavefrontMeterRegistry extends StepMeterRegistry {
         private final WavefrontConfig config;
 
         private Clock clock = Clock.SYSTEM;
-        private ThreadFactory threadFactory = Executors.defaultThreadFactory();
-        private HttpClient httpClient;
+        private ThreadFactory threadFactory = DEFAULT_THREAD_FACTORY;
+        private HttpSender httpClient;
 
-        public Builder(WavefrontConfig config) {
+        @SuppressWarnings("deprecation")
+        Builder(WavefrontConfig config) {
             this.config = config;
-            this.httpClient = new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout());
+            this.httpClient = new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout());
         }
 
         public Builder clock(Clock clock) {
@@ -275,7 +298,7 @@ public class WavefrontMeterRegistry extends StepMeterRegistry {
             return this;
         }
 
-        public Builder httpClient(HttpClient httpClient) {
+        public Builder httpClient(HttpSender httpClient) {
             this.httpClient = httpClient;
             return this;
         }

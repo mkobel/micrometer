@@ -17,48 +17,66 @@ package io.micrometer.influx;
 
 import io.micrometer.core.instrument.*;
 import io.micrometer.core.instrument.step.StepMeterRegistry;
-import io.micrometer.core.instrument.util.DoubleFormat;
-import io.micrometer.core.instrument.util.MeterPartition;
-import io.micrometer.core.instrument.util.StringUtils;
-import io.micrometer.core.ipc.http.HttpClient;
-import io.micrometer.core.ipc.http.HttpUrlConnectionClient;
+import io.micrometer.core.instrument.util.*;
+import io.micrometer.core.ipc.http.HttpSender;
+import io.micrometer.core.ipc.http.HttpUrlConnectionSender;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.MalformedURLException;
 import java.net.URLEncoder;
 import java.util.List;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
-import static io.micrometer.core.instrument.Meter.Type.match;
 import static java.util.stream.Collectors.joining;
 
 /**
  * @author Jon Schneider
  */
 public class InfluxMeterRegistry extends StepMeterRegistry {
+    private static final ThreadFactory DEFAULT_THREAD_FACTORY = new NamedThreadFactory("influx-metrics-publisher");
     private final InfluxConfig config;
-    private final HttpClient httpClient;
+    private final HttpSender httpClient;
     private final Logger logger = LoggerFactory.getLogger(InfluxMeterRegistry.class);
     private boolean databaseExists = false;
 
-    public InfluxMeterRegistry(InfluxConfig config, Clock clock, ThreadFactory threadFactory) {
-        this(config, clock, threadFactory, new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout()));
-    }
-
+    @SuppressWarnings("deprecation")
     public InfluxMeterRegistry(InfluxConfig config, Clock clock) {
-        this(config, clock, Executors.defaultThreadFactory());
+        this(config, clock, DEFAULT_THREAD_FACTORY,
+                new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
     }
 
-    private InfluxMeterRegistry(InfluxConfig config, Clock clock, ThreadFactory threadFactory, HttpClient httpClient) {
+    /**
+     * @param config        Configuration options for the registry that are describable as properties.
+     * @param clock         The clock to use for timings.
+     * @param threadFactory The thread factory to use to create the publishing thread.
+     * @deprecated Use {@link #builder(InfluxConfig)} instead.
+     */
+    @Deprecated
+    public InfluxMeterRegistry(InfluxConfig config, Clock clock, ThreadFactory threadFactory) {
+        this(config, clock, threadFactory, new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout()));
+    }
+
+    private InfluxMeterRegistry(InfluxConfig config, Clock clock, ThreadFactory threadFactory, HttpSender httpClient) {
         super(config, clock);
-        this.config().namingConvention(new InfluxNamingConvention());
+        config().namingConvention(new InfluxNamingConvention());
         this.config = config;
         this.httpClient = httpClient;
         start(threadFactory);
+    }
+
+    public static Builder builder(InfluxConfig config) {
+        return new Builder(config);
+    }
+
+    @Override
+    public void start(ThreadFactory threadFactory) {
+        if (config.enabled()) {
+            logger.info("publishing metrics to influx every " + TimeUtils.format(config.step()));
+        }
+        super.start(threadFactory);
     }
 
     private void createDatabaseIfNecessary() {
@@ -99,7 +117,7 @@ public class InfluxMeterRegistry extends StepMeterRegistry {
                 httpClient.post(influxEndpoint)
                         .withBasicAuthentication(config.userName(), config.password())
                         .withPlainText(batch.stream()
-                                .flatMap(m -> match(m,
+                                .flatMap(m -> m.match(
                                         gauge -> writeGauge(gauge.getId(), gauge.value()),
                                         counter -> writeCounter(counter.getId(), counter.count()),
                                         this::writeTimer,
@@ -122,21 +140,6 @@ public class InfluxMeterRegistry extends StepMeterRegistry {
             throw new IllegalArgumentException("Malformed InfluxDB publishing endpoint, see '" + config.prefix() + ".uri'", e);
         } catch (Throwable e) {
             logger.error("failed to send metrics to influx", e);
-        }
-    }
-
-    class Field {
-        final String key;
-        final double value;
-
-        Field(String key, double value) {
-            this.key = key;
-            this.value = value;
-        }
-
-        @Override
-        public String toString() {
-            return key + "=" + DoubleFormat.decimalOrNan(value);
         }
     }
 
@@ -217,20 +220,17 @@ public class InfluxMeterRegistry extends StepMeterRegistry {
         return TimeUnit.MILLISECONDS;
     }
 
-    public static Builder builder(InfluxConfig config) {
-        return new Builder(config);
-    }
-
     public static class Builder {
         private final InfluxConfig config;
 
         private Clock clock = Clock.SYSTEM;
-        private ThreadFactory threadFactory = Executors.defaultThreadFactory();
-        private HttpClient httpClient;
+        private ThreadFactory threadFactory = DEFAULT_THREAD_FACTORY;
+        private HttpSender httpClient;
 
-        public Builder(InfluxConfig config) {
+        @SuppressWarnings("deprecation")
+        Builder(InfluxConfig config) {
             this.config = config;
-            this.httpClient = new HttpUrlConnectionClient(config.connectTimeout(), config.readTimeout());
+            this.httpClient = new HttpUrlConnectionSender(config.connectTimeout(), config.readTimeout());
         }
 
         public Builder clock(Clock clock) {
@@ -243,13 +243,28 @@ public class InfluxMeterRegistry extends StepMeterRegistry {
             return this;
         }
 
-        public Builder httpClient(HttpClient httpClient) {
+        public Builder httpClient(HttpSender httpClient) {
             this.httpClient = httpClient;
             return this;
         }
 
         public InfluxMeterRegistry build() {
             return new InfluxMeterRegistry(config, clock, threadFactory, httpClient);
+        }
+    }
+
+    class Field {
+        final String key;
+        final double value;
+
+        Field(String key, double value) {
+            this.key = key;
+            this.value = value;
+        }
+
+        @Override
+        public String toString() {
+            return key + "=" + DoubleFormat.decimalOrNan(value);
         }
     }
 }

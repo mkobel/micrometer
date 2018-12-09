@@ -27,6 +27,8 @@ import io.micrometer.core.instrument.*;
 import io.micrometer.core.instrument.config.NamingConvention;
 import io.micrometer.core.instrument.step.StepMeterRegistry;
 import io.micrometer.core.instrument.util.MeterPartition;
+import io.micrometer.core.instrument.util.NamedThreadFactory;
+import io.micrometer.core.instrument.util.TimeUtils;
 import io.micrometer.core.lang.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,20 +37,19 @@ import java.net.URI;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import static com.signalfx.metrics.protobuf.SignalFxProtocolBuffers.MetricType.COUNTER;
 import static com.signalfx.metrics.protobuf.SignalFxProtocolBuffers.MetricType.GAUGE;
-import static io.micrometer.core.instrument.Meter.Type.match;
 import static java.util.stream.StreamSupport.stream;
 
 /**
  * @author Jon Schneider
  */
 public class SignalFxMeterRegistry extends StepMeterRegistry {
+    private static final ThreadFactory DEFAULT_THREAD_FACTORY = new NamedThreadFactory("signalfx-metrics-publisher");
     private final Logger logger = LoggerFactory.getLogger(SignalFxMeterRegistry.class);
     private final SignalFxConfig config;
     private final HttpDataPointProtobufReceiverFactory dataPointReceiverFactory;
@@ -57,7 +58,7 @@ public class SignalFxMeterRegistry extends StepMeterRegistry {
             metricError -> this.logger.warn("failed to send metrics: {}", metricError.getMessage()));
 
     public SignalFxMeterRegistry(SignalFxConfig config, Clock clock) {
-        this(config, clock, Executors.defaultThreadFactory());
+        this(config, clock, DEFAULT_THREAD_FACTORY);
     }
 
     public SignalFxMeterRegistry(SignalFxConfig config, Clock clock, ThreadFactory threadFactory) {
@@ -67,9 +68,9 @@ public class SignalFxMeterRegistry extends StepMeterRegistry {
         URI apiUri = URI.create(config.uri());
         int port = apiUri.getPort();
         if (port == -1) {
-            if ("http".equals(apiUri.getScheme())) {
+            if ("http" .equals(apiUri.getScheme())) {
                 port = 80;
-            } else if ("https".equals(apiUri.getScheme())) {
+            } else if ("https" .equals(apiUri.getScheme())) {
                 port = 443;
             }
         }
@@ -84,6 +85,14 @@ public class SignalFxMeterRegistry extends StepMeterRegistry {
     }
 
     @Override
+    public void start(ThreadFactory threadFactory) {
+        if (config.enabled()) {
+            logger.info("publishing metrics to signalfx every " + TimeUtils.format(config.step()));
+        }
+        super.start(threadFactory);
+    }
+
+    @Override
     protected void publish() {
         final long timestamp = clock.wallTime();
 
@@ -94,7 +103,7 @@ public class SignalFxMeterRegistry extends StepMeterRegistry {
         for (List<Meter> batch : MeterPartition.partition(this, config.batchSize())) {
             try (AggregateMetricSender.Session session = metricSender.createSession()) {
                 batch.stream()
-                        .map(meter -> match(meter,
+                        .map(meter -> meter.match(
                                 this::addGauge,
                                 this::addCounter,
                                 this::addTimer,

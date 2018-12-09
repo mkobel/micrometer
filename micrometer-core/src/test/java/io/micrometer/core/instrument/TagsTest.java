@@ -26,10 +26,48 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
+ * Tests for {@link Tags}.
+ *
  * @author Phil Webb
  * @author Maciej Walkowiak
+ * @author Jon Schneider
+ * @author Johnny Lim
  */
 class TagsTest {
+
+    @Test
+    void dedup() {
+        assertThat(Tags.of("k1", "v1", "k2", "v2")).containsExactly(Tag.of("k1", "v1"), Tag.of("k2", "v2"));
+        assertThat(Tags.of("k1", "v1", "k1", "v2")).containsExactly(Tag.of("k1", "v2"));
+        assertThat(Tags.of("k1", "v1", "k1", "v2", "k3", "v3")).containsExactly(Tag.of("k1", "v2"), Tag.of("k3", "v3"));
+        assertThat(Tags.of("k1", "v1", "k2", "v2", "k2", "v3")).containsExactly(Tag.of("k1", "v1"), Tag.of("k2", "v3"));
+    }
+
+    @Test
+    void stream() {
+        Tags tags = Tags.of(Tag.of("k1",  "v1"), Tag.of("k1",  "v1"), Tag.of("k2", "v2"));
+        assertThat(tags.stream()).hasSize(2);
+    }
+
+    @Test
+    void tagsHashCode() {
+        Tags tags = Tags.of(Tag.of("k1",  "v1"), Tag.of("k1",  "v1"), Tag.of("k2", "v2"));
+        Tags tags2 = Tags.of(Tag.of("k1",  "v1"), Tag.of("k2",  "v2"));
+        assertThat(tags.hashCode()).isEqualTo(tags2.hashCode());
+    }
+
+    @Test
+    void tagsToString() {
+        Tags tags = Tags.of(Tag.of("k1",  "v1"), Tag.of("k1",  "v1"), Tag.of("k2", "v2"));
+        assertThat(tags.toString()).isEqualTo("[tag(k1=v1),tag(k2=v2)]");
+    }
+
+    @Test
+    void tagsEquality() {
+        Tags tags = Tags.of(Tag.of("k1",  "v1"), Tag.of("k1",  "v1"), Tag.of("k2", "v2"));
+        Tags tags2 = Tags.of(Tag.of("k1",  "v1"), Tag.of("k2",  "v2"));
+        assertThat(tags).isEqualTo(tags2);
+    }
 
     @Test
     void createsListWithSingleTag() {
@@ -107,6 +145,17 @@ class TagsTest {
         Tags source = Tags.of("t1", "v1");
         Tags merged = source.and((Tag[]) null);
         assertThat(source).isSameAs(merged);
+    }
+
+    @Test
+    void andTagsMultipleTimesShouldWork() {
+        Tags tags = Tags.empty().and(Tag.of("t1", "v1"));
+
+        Tags firstAnd = tags.and(Tag.of("t1", "v1"));
+        assertThat(firstAnd).isEqualTo(tags);
+
+        Tags secondAnd = firstAnd.and(Tag.of("t1", "v1"));
+        assertThat(secondAnd).isEqualTo(tags);
     }
 
     @Test
